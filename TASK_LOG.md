@@ -16,3 +16,9 @@
 
 - 用户要求「只测 IP」：删除 Netflix/ChatGPT/YouTube 与 `media` 参数。
 - 版本：`2026-07-19.qx2-ip`。
+
+### 推送 GitHub
+
+- 账号：`dhicoc`
+- 仓库：https://github.com/dhicoc/qx-ipquality（public）
+- 分支：`master`

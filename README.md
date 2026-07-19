@@ -7,17 +7,22 @@
 - `src/ipquality-qx.js` — 脚本
 - `conf/ipquality-qx.conf` — 任务配置片段
 
+## 仓库
+
+- GitHub：https://github.com/dhicoc/qx-ipquality
+- 脚本 raw：https://raw.githubusercontent.com/dhicoc/qx-ipquality/master/src/ipquality-qx.js
+
 ## 安装
 
 ```ini
 [task_local]
-event-interaction https://你的地址/ipquality-qx.js, tag=节点IP质量检测, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Available.png, enabled=true
+event-interaction https://raw.githubusercontent.com/dhicoc/qx-ipquality/master/src/ipquality-qx.js, tag=节点IP质量检测, img-url=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Available.png, enabled=true
 ```
 
 指定策略：
 
 ```ini
-event-interaction https://你的地址/ipquality-qx.js, tag=IP检测·香港, enabled=true, argument=policy=香港&mask=0
+event-interaction https://raw.githubusercontent.com/dhicoc/qx-ipquality/master/src/ipquality-qx.js, tag=IP检测·香港, enabled=true, argument=policy=香港&mask=0
 ```
 
 **风车 → 工具 → 节点IP质量检测** 运行，看通知。
