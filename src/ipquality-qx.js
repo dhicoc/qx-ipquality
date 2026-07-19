@@ -115,9 +115,6 @@ const warn = [];
     warn.slice(0, 5).forEach((w) => lines.push(`  ${w}`));
   }
 
-  lines.push("");
-  lines.push(`v${VERSION}`);
-
   const title = "节点 IP 质量检测";
   const subtitle = FROM_UI
     ? POLICY
