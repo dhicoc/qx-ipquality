@@ -88,16 +88,10 @@ const warn = [];
   if (basic.org) lines.push(`组织  ${basic.org}`);
   if (basic.timezone) lines.push(`时区  ${basic.timezone}`);
 
-  lines.push("");
-  if (FROM_UI) {
+  if (FROM_UI && POLICY) {
     lines.push(`节点  ${POLICY}`);
-    lines.push("来源  长按节点 (UIAction)");
   } else if (POLICY) {
     lines.push(`策略  ${POLICY}`);
-    lines.push("来源  argument / 变量");
-  } else {
-    lines.push("策略  默认路由");
-    lines.push("来源  工具页直接运行");
   }
 
   if (risks.length) {
