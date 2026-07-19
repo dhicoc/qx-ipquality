@@ -1,34 +1,63 @@
 /**
- * 节点 IP 质量检测 · Quantumult X 最小版（仅 IP）
+ * 节点 IP 质量检测 · Quantumult X（仅 IP）
  *
- * - 探测当前策略出口 IPv4
- * - 基础信息：国家 / 城市 / ASN / ISP
- * - 风险标记：proxy / hosting / datacenter / vpn / tor（有则显示）
- * - 结果以 $notify 文本输出
+ * 正确用法（测指定节点）：
+ *   在「节点」列表中 长按目标节点 → 选择本脚本
+ *   此时 $environment.params = 节点 tag，请求会走该节点
  *
- * argument 示例：
- *   policy=节点或策略组名&mask=0
+ * 备用法（测默认路由 / 写死策略）：
+ *   工具页直接点运行，或 argument=policy=节点名&mask=0
  *
  * @Updated: 2026-07-19
+ * @Reference: crossutility sample-fetch-opts-policy.js
  */
 
-const VERSION = "2026-07-19.qx2-ip";
+const VERSION = "2026-07-19.qx3-ip";
 const UA =
   "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1";
 
-const args = parseArgument(typeof $argument !== "undefined" ? $argument : "");
-const POLICY = clean(args.policy || args.node || "");
+// URL hash / argument 变量（官方 $environment.variables，兼容 $argument）
+const envVars =
+  typeof $environment !== "undefined" && $environment.variables
+    ? $environment.variables
+    : {};
+const argRaw =
+  typeof $argument !== "undefined" && $argument !== null ? String($argument) : "";
+const args = Object.assign({}, envVars, parseArgument(argRaw));
+
+// 长按节点时 QX 自动传入节点 tag；否则用 argument / 变量里的 policy|node
+const UI_NODE =
+  typeof $environment !== "undefined" && $environment.params
+    ? clean(String($environment.params))
+    : "";
+const ARG_POLICY = clean(args.policy || args.node || "");
+const BARE_POLICY =
+  !ARG_POLICY && argRaw && argRaw.indexOf("=") < 0 ? clean(argRaw) : "";
+const POLICY = UI_NODE || ARG_POLICY || BARE_POLICY;
+const FROM_UI = !!UI_NODE;
 const MASK_IP = isTruthy(args.mask, false);
 
 const lines = [];
 const warn = [];
 
 (async () => {
-  log(`start ${VERSION} policy=${POLICY || "(默认路由)"}`);
+  log(
+    `start ${VERSION} policy=${POLICY || "(默认路由)"} fromUI=${FROM_UI}`
+  );
+
+  if (!POLICY) {
+    warn.push(
+      "未指定节点：测的是当前默认路由。请长按目标节点再运行本脚本，或在 argument 写 policy=完整节点名"
+    );
+  }
 
   const ip = await discoverIP();
   if (!ip) {
-    fail("无法获取出口 IP（请检查网络/策略名是否正确）");
+    fail(
+      POLICY
+        ? `无法经「${POLICY}」获取出口 IP（节点名是否完全一致？VPN 是否已开启？）`
+        : "无法获取出口 IP（请检查网络 / 是否开启 Quantumult X Tunnel）"
+    );
     return;
   }
 
@@ -58,7 +87,18 @@ const warn = [];
   if (basic.asn) lines.push(`ASN  ${basic.asn}`);
   if (basic.org) lines.push(`组织  ${basic.org}`);
   if (basic.timezone) lines.push(`时区  ${basic.timezone}`);
-  if (POLICY) lines.push(`策略  ${POLICY}`);
+
+  lines.push("");
+  if (FROM_UI) {
+    lines.push(`节点  ${POLICY}`);
+    lines.push("来源  长按节点 (UIAction)");
+  } else if (POLICY) {
+    lines.push(`策略  ${POLICY}`);
+    lines.push("来源  argument / 变量");
+  } else {
+    lines.push("策略  默认路由");
+    lines.push("来源  工具页直接运行");
+  }
 
   if (risks.length) {
     lines.push("");
@@ -72,13 +112,32 @@ const warn = [];
   if (warn.length) {
     lines.push("");
     lines.push("· 提示");
-    warn.slice(0, 4).forEach((w) => lines.push(`  ${w}`));
+    warn.slice(0, 5).forEach((w) => lines.push(`  ${w}`));
   }
 
   lines.push("");
-  lines.push(`v${VERSION} · 仅 IP`);
+  lines.push(`v${VERSION}`);
 
-  $notify("节点 IP 质量检测", displayIP(basic.ip), lines.join("\n"));
+  const title = "节点 IP 质量检测";
+  const subtitle = FROM_UI
+    ? POLICY
+    : POLICY
+      ? `策略 · ${POLICY}`
+      : "默认路由";
+  const body = lines.join("\n");
+
+  // 长按节点时用面板展示；同时发通知便于复制
+  if (FROM_UI) {
+    const html =
+      `<p style="text-align:left;font-family:-apple-system;font-size:14px;line-height:1.45;font-weight:normal;white-space:pre-wrap">` +
+      escapeHtml(body) +
+      `</p>`;
+    $notify(title, subtitle, body);
+    $done({ title, htmlMessage: html });
+    return;
+  }
+
+  $notify(title, subtitle, body);
   $done();
 })().catch((e) => {
   fail(`异常: ${err(e)}`);
@@ -222,7 +281,7 @@ function buildRisks(ipApi, ipapiIs) {
   return out;
 }
 
-// ── HTTP（Quantumult X $task.fetch）──────────────────────
+// ── HTTP ─────────────────────────────────────────────────
 
 function fetchJson(url, options) {
   return fetchRaw(url, options).then((r) => {
@@ -247,7 +306,8 @@ function fetchRaw(url, options) {
   };
   if (typeof opt.body !== "undefined") req.body = opt.body;
 
-  // 出口探测绑策略；库查询不绑（IP 在 URL 内）
+  // 官方：opts.policy 可为节点 tag 或策略名；长按节点时传入该节点
+  // 库查询不绑策略（IP 已在 URL）
   if (!opt.direct && POLICY) {
     req.opts = { policy: POLICY };
   }
@@ -347,6 +407,15 @@ function clean(value) {
   return text;
 }
 
+function escapeHtml(value) {
+  return String(value === null || typeof value === "undefined" ? "" : value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 function err(e) {
   return e && e.message ? e.message : String(e);
 }
@@ -356,6 +425,15 @@ function log(msg) {
 }
 
 function fail(message) {
-  $notify("节点 IP 质量检测", "失败", message);
+  const title = "节点 IP 质量检测";
+  $notify(title, "失败", message);
+  if (FROM_UI) {
+    const html =
+      `<p style="text-align:center;font-family:-apple-system;font-size:large">` +
+      escapeHtml(message) +
+      `</p>`;
+    $done({ title, htmlMessage: html });
+    return;
+  }
   $done();
 }

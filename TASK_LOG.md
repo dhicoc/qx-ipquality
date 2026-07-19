@@ -22,3 +22,10 @@
 - 账号：`dhicoc`
 - 仓库：https://github.com/dhicoc/qx-ipquality（public）
 - 分支：`master`
+
+### qx3：长按节点测指定出口
+
+- 用户反馈：只能测当前连接，不能测手动选择的节点。
+- 原因：QX 不会读「列表点选」；应使用 UIAction：`$environment.params` = 长按节点 tag。
+- 修复：优先 `opts.policy = $environment.params`；长按用 htmlMessage 面板；文档改成长按用法。
+- 版本：`2026-07-19.qx3-ip`。
