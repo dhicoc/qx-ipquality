@@ -209,12 +209,7 @@ function buildBasic(ip, ipApi, ipapiIs) {
     clean(asnObj.org) ||
     clean(ipapiIs && ipapiIs.company && ipapiIs.company.name);
 
-  let nature = "";
-  if (okApi && okApi.hosting) nature = "机房/托管";
-  else if (ipapiIs && (ipapiIs.is_datacenter || ipapiIs.is_hosting))
-    nature = "机房/托管";
-  else if (okApi && okApi.mobile) nature = "移动网络";
-  else if (okApi || ipapiIs) nature = "普通出口";
+  const nature = classifyNature(okApi, ipapiIs);
 
   return {
     ip,
@@ -227,6 +222,49 @@ function buildBasic(ip, ipApi, ipapiIs) {
     org,
     timezone: clean(okApi && okApi.timezone) || clean(loc.timezone),
   };
+}
+
+/**
+ * 把库字段收成用户能看懂的一句话。
+ * 说明：这是第三方库标记，不是官方「住宅认证」。
+ */
+function classifyNature(okApi, ipapiIs) {
+  const hosting =
+    !!(okApi && okApi.hosting) ||
+    !!(ipapiIs && (ipapiIs.is_datacenter || ipapiIs.is_hosting));
+  const mobile =
+    !!(okApi && okApi.mobile) || !!(ipapiIs && ipapiIs.is_mobile);
+  const proxyLike =
+    !!(okApi && okApi.proxy) ||
+    !!(ipapiIs && (ipapiIs.is_proxy || ipapiIs.is_vpn || ipapiIs.is_tor));
+
+  const typeBits = [
+    ipapiIs && ipapiIs.company && ipapiIs.company.type,
+    ipapiIs && ipapiIs.asn && ipapiIs.asn.type,
+    ipapiIs && ipapiIs.company && ipapiIs.company.abuser_score,
+  ]
+    .map((x) => clean(x).toLowerCase())
+    .filter(Boolean)
+    .join(" ");
+
+  // 机房优先：最影响「能不能当家宽用」的判断
+  if (hosting || /\b(hosting|data\s*center|datacenter|cdn)\b/.test(typeBits)) {
+    return "机房 IP · 服务器/数据中心，一般不是家用宽带";
+  }
+  if (mobile || /\bmobile\b/.test(typeBits)) {
+    return "移动 IP · 手机/蜂窝流量网络";
+  }
+  if (proxyLike) {
+    return "代理特征 · 库标记像代理/VPN（仅供参考）";
+  }
+  if (/\b(isp|residential|education|government)\b/.test(typeBits)) {
+    return "家宽倾向 · 更像宽带运营商线路（非机房）";
+  }
+  // 有查询结果、但没有机房/移动标记 → 多数情况是运营商线路
+  if (okApi || ipapiIs) {
+    return "家宽倾向 · 未检出机房/移动标记（不等于已认证住宅）";
+  }
+  return "";
 }
 
 function buildRisks(ipApi, ipapiIs) {
