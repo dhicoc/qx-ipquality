@@ -8,18 +8,14 @@
  *
  * 长按节点运行。
  * 参数：
- *   mask=0|1
- *   pure=1|0
- *   block=0|1|full   默认 1（完整阻断链；0 关闭；full 同 1）
- *   dns=1|0          默认 1
- *   rtt=1|0          默认 1
- *   v6=1|0           默认 1
+ *   mask=0|1  pure=1|0  block=0|1|full  dns=1|0  rtt=1|0  v6=1|0
+ *   verbose=0|1  默认 0 精简结果；1 显示完整明细
  *
  * @Updated: 2026-07-20
  * @Ref: https://gist.github.com/RavelloH/383354955aa3800e1d7e98666e11e16f
  */
 
-const VERSION = "2026-07-20.qx5";
+const VERSION = "2026-07-20.qx5.1";
 const UA =
   "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 Version/16.0 Mobile/15E148 Safari/604.1";
 const IPPURE_URL = "https://my.ippure.com/v1/info";
@@ -44,6 +40,7 @@ const PURE_ON = isTruthy(args.pure, true);
 const DNS_ON = isTruthy(args.dns, true);
 const RTT_ON = isTruthy(args.rtt, true);
 const V6_ON = isTruthy(args.v6, true);
+const VERBOSE = isTruthy(args.verbose, false);
 // 默认开启阻断链（对齐 block_check）；超时风险见 HARD_MS
 const BLOCK_MODE = normalizeBlockMode(args.block, "1");
 
@@ -1044,14 +1041,138 @@ function summarizeLibs(ipApi, ipapiIs, ipinfo, ipwho, ipure) {
   return { ok: ok, miss: miss };
 }
 
-// ── 渲染 ─────────────────────────────────────────────────
+// ── 渲染（默认精简；verbose=1 展开）──────────────────────
+
+function shortNature(s) {
+  const t = String(s || "");
+  if (!t) return "";
+  // 去掉「· 后解释」和来源尾巴，只留关键词
+  return t
+    .replace(/，.*$/, "")
+    .replace(/·\s*(服务器|一般|未检出|原生倾向|广播|IPPure|数据中心).*$/i, "")
+    .replace(/\s*·\s*$/, "")
+    .trim() || t.split("·")[0].trim();
+}
+
+function shortRegion(region) {
+  return String(region || "")
+    .replace(/^(?:\uD83C[\uDDE6-\uDDFF]){2}\s*/g, "")
+    .replace(/^\[CN\]\s*中国台湾/, "中国台湾")
+    .replace(/^\[([A-Z]{2})\]\s*/, "")
+    .trim();
+}
+
+function compactRisks(risks) {
+  const list = risks || [];
+  const hits = list.filter(function (r) {
+    return r.level === "warn" || r.level === "bad";
+  });
+  if (!hits.length) return "🟢 清洁";
+  return hits
+    .slice(0, 3)
+    .map(function (r) {
+      return r.icon + " " + r.text.replace(/　/g, " ");
+    })
+    .join(" · ");
+}
 
 function renderAll(basic, risks, pure, block, rtt, dns, libs, theme) {
-  // IP 双栈
+  if (VERBOSE) {
+    renderVerbose(basic, risks, pure, block, rtt, dns, libs, theme);
+  } else {
+    renderCompact(basic, risks, pure, block, rtt, dns, theme);
+  }
+}
+
+/** 默认：尽量一屏看完 */
+function renderCompact(basic, risks, pure, block, rtt, dns, theme) {
+  const ipLine =
+    basic.v4 || basic.v6
+      ? (basic.v4 ? displayIP(basic.v4) : "") +
+        (basic.v4 && basic.v6 ? " / " : "") +
+        (basic.v6 ? "v6 " + displayIP(basic.v6) : "")
+      : "未获取";
+  lines.push(theme.titleEmoji + " " + ipLine);
+
+  const locBits = [];
+  if (basic.flagEmoji) locBits.push(basic.flagEmoji);
+  const reg = shortRegion(basic.region);
+  if (reg) locBits.push(reg);
+  if (basic.city) locBits.push(basic.city);
+  if (locBits.length) lines.push(locBits.join(" · "));
+
+  const meta = [];
+  const nat = shortNature(basic.nature);
+  if (nat) meta.push(nat);
+  if (basic.asn) meta.push(basic.asn);
+  if (basic.org) meta.push(truncate(basic.org, 22));
+  if (meta.length) lines.push(meta.join(" · "));
+
+  const pureBits = [];
+  if (pure) {
+    pureBits.push(pure.type || "IPPure");
+    if (pure.score !== null) pureBits.push("欺诈" + pure.score);
+  }
+  if (rtt && rtt.ms != null) pureBits.push(rtt.ms + "ms");
+  if (dns) {
+    pureBits.push(
+      dns.level === "ok" ? "DNS✓" : dns.level === "warn" ? "DNS≠" : "DNS?"
+    );
+  }
+  if (pureBits.length) lines.push(pureBits.join(" · "));
+
+  // 风险：一行摘要
+  if (risks && risks.length) lines.push(compactRisks(risks));
+
+  if (block) {
+    const b = [];
+    b.push(block.nodeOk ? "节点✓" : "节点✗");
+    if (block.directOk !== null && block.directOk !== undefined) {
+      b.push(block.directOk ? "本机✓" : "本机✗");
+    }
+    if (block.remoteOk !== null && block.remoteOk !== undefined) {
+      b.push(block.remoteOk ? "远端✓" : "远端✗");
+    }
+    lines.push(b.join(" ") + " · " + shortConclusion(block.conclusion));
+  }
+
+  if (POLICY) lines.push("📡 " + truncate(POLICY, 28));
+  if (warn.length) {
+    lines.push("⚠️ " + truncate(warn[0], 36));
+  }
+
+  const body = lines.join("\n");
+  doneOK(
+    theme.titleEmoji + " IP检测",
+    POLICY ? truncate(POLICY, 20) : "完成",
+    body,
+    buildHtmlCompact(basic, risks, pure, block, rtt, dns, theme),
+    theme
+  );
+}
+
+function shortConclusion(c) {
+  const t = String(c || "");
+  if (t.indexOf("节点正常") >= 0) return "正常";
+  if (t.indexOf("离线") >= 0) return "离线";
+  if (t.indexOf("本机网络异常") >= 0) return "本机异常";
+  if (t.indexOf("GFW") >= 0) return "疑似GFW";
+  if (t.indexOf("运营商") >= 0) return "疑似运营商拦截";
+  if (t.indexOf("可代理") >= 0) return "代理通·端口异常";
+  if (t.indexOf("代理可达") >= 0) return "代理可达";
+  return truncate(t.replace(/[✅❌⚠️🚫💤❓]/g, "").trim(), 18);
+}
+
+function truncate(s, n) {
+  const t = String(s || "");
+  if (t.length <= n) return t;
+  return t.slice(0, n - 1) + "…";
+}
+
+function renderVerbose(basic, risks, pure, block, rtt, dns, libs, theme) {
   if (basic.v4) lines.push("🌐 IPv4　" + displayIP(basic.v4));
   if (basic.v6) lines.push("🧬 IPv6　" + displayIP(basic.v6));
   if (!basic.v4 && !basic.v6) lines.push("🌐 IP　未获取");
-
   if (basic.nature) lines.push(theme.natureEmoji + " 类型　" + basic.nature);
   if (basic.region) lines.push("📍 地区　" + basic.region);
   if (basic.city) lines.push("🏙️ 城市　" + basic.city);
@@ -1059,114 +1180,149 @@ function renderAll(basic, risks, pure, block, rtt, dns, libs, theme) {
   if (basic.org) lines.push("🏢 组织　" + basic.org);
   if (basic.timezone) lines.push("🕐 时区　" + basic.timezone);
   if (POLICY) lines.push("📡 节点　" + POLICY);
-
-  if (rtt && rtt.ms != null) {
-    lines.push("⚡ 延迟　" + rtt.ms + " ms（HTTP RTT）");
-  }
-
+  if (rtt && rtt.ms != null) lines.push("⚡ 延迟　" + rtt.ms + " ms");
   if (dns) {
-    lines.push("");
-    lines.push("🧭 DNS 出口");
-    if (dns.dnsIP) lines.push("　DNS　" + dns.dnsIP);
-    if (dns.httpIP) lines.push("　HTTP　" + dns.httpIP);
+    lines.push("🧭 DNS　" + (dns.dnsIP || "?") + " / HTTP　" + (dns.httpIP || "?"));
     lines.push(
       "　" +
-        (dns.level === "ok" ? "✅" : dns.level === "warn" ? "🟠" : "⚪") +
+        (dns.level === "ok" ? "✅" : "🟠") +
         " " +
         dns.text
     );
   }
-
   if (pure) {
-    lines.push("");
-    lines.push("✨ IPPure 纯净度");
-    lines.push("　类型　" + pure.type);
-    if (pure.score !== null) {
-      lines.push("　欺诈值　" + pure.score + " · " + pure.level);
-    }
+    lines.push(
+      "✨ " +
+        pure.type +
+        (pure.score !== null ? " · 欺诈" + pure.score + pure.level : "")
+    );
   }
-
   if (risks && risks.length) {
-    lines.push("");
-    lines.push("🛡️ 风险");
     risks.forEach(function (r) {
-      lines.push("　" + r.icon + " " + r.text);
+      lines.push(r.icon + " " + r.text);
     });
   }
-
   if (block) {
-    lines.push("");
-    lines.push("🔗 连通 / 阻断");
-    lines.push("　节点代理　" + (block.nodeOk ? "✅ 正常" : "❌ 不可达"));
-    if (block.directOk !== null && block.directOk !== undefined) {
+    lines.push(
+      "🔗 " +
+        (block.nodeOk ? "节点✓" : "节点✗") +
+        " " +
+        (block.directOk ? "本机✓" : block.directOk === false ? "本机✗" : "") +
+        " " +
+        (block.remoteOk ? "远端✓" : block.remoteOk === false ? "远端✗" : "")
+    );
+    lines.push("　" + block.conclusion);
+    if (block.remoteItems && block.remoteItems.length) {
       lines.push(
-        "　本机网络　" + (block.directOk ? "✅ 正常" : "❌ 异常")
+        "　" +
+          block.remoteItems
+            .slice(0, 4)
+            .map(function (it) {
+              return it.flag + it.ms;
+            })
+            .join(" ")
       );
     }
-    if (block.remoteOk !== null && block.remoteOk !== undefined) {
-      lines.push(
-        "　远端探测　" + (block.remoteOk ? "✅ 可达" : "❌ 不可达")
-      );
-      if (block.remoteItems && block.remoteItems.length) {
-        lines.push(
-          "　" +
-            block.remoteItems
-              .slice(0, 6)
-              .map(function (it) {
-                return it.flag + " " + it.ms;
-              })
-              .join("  ")
-        );
-      } else if (block.remoteError) {
-        lines.push("　" + block.remoteError);
-      }
-    }
-    if (block.gpAnalysis && block.gpAnalysis.ispGroups) {
-      lines.push("　国内探测：");
-      const order = ["中国电信", "中国联通", "中国移动"];
-      const abbr = { 中国电信: "电信", 中国联通: "联通", 中国移动: "移动" };
-      order.forEach(function (k) {
-        const g = block.gpAnalysis.ispGroups[k];
-        if (!g) return;
-        g.probes.slice(0, 3).forEach(function (p) {
-          lines.push(
-            "　  " +
-              (abbr[k] || k) +
-              "·" +
-              p.city +
-              " " +
-              (p.ok ? "✅" : "❌") +
-              " " +
-              p.ms
-          );
-        });
-      });
-    }
-    lines.push("　结论　" + block.conclusion);
   }
-
-  if (libs && libs.ok && libs.ok.length) {
-    lines.push("");
-    lines.push("📚 数据源　" + libs.ok.join(" · "));
-  }
-
-  if (warn.length) {
-    lines.push("");
-    lines.push("💡 提示");
-    warn.slice(0, 5).forEach(function (w) {
-      lines.push("　⚠️ " + w);
-    });
-  }
-
-  lines.push("");
-  lines.push("v" + VERSION + " · " + (Date.now() - tStart) + "ms");
+  if (warn.length) lines.push("⚠️ " + warn.slice(0, 2).join("；"));
 
   doneOK(
-    theme.titleEmoji + " 节点 IP 质量检测",
-    POLICY || "默认路由",
+    theme.titleEmoji + " IP检测",
+    POLICY || "完成",
     lines.join("\n"),
-    buildHtml(basic, risks, pure, block, rtt, dns, libs, theme),
+    buildHtmlCompact(basic, risks, pure, block, rtt, dns, theme),
     theme
+  );
+}
+
+function buildHtmlCompact(basic, risks, pure, block, rtt, dns, theme) {
+  const ipShow =
+    (basic.v4 ? displayIP(basic.v4) : "") +
+    (basic.v4 && basic.v6 ? "\n" : "") +
+    (basic.v6 ? displayIP(basic.v6) : "");
+
+  const bits = [];
+  const nat = shortNature(basic.nature);
+  const reg = shortRegion(basic.region);
+  if (reg) bits.push((basic.flagEmoji ? basic.flagEmoji + " " : "") + reg);
+  if (basic.city) bits.push(basic.city);
+  if (nat) bits.push(nat);
+  if (basic.asn) bits.push(basic.asn);
+  if (basic.org) bits.push(truncate(basic.org, 28));
+
+  const status = [];
+  if (pure) {
+    status.push(
+      pure.type + (pure.score !== null ? " · 欺诈" + pure.score : "")
+    );
+  }
+  if (rtt && rtt.ms != null) status.push(rtt.ms + " ms");
+  if (dns) {
+    status.push(
+      dns.level === "ok" ? "DNS 一致" : dns.level === "warn" ? "DNS 不一致" : "DNS ?"
+    );
+  }
+  if (risks && risks.length) status.push(compactRisks(risks));
+
+  let blockLine = "";
+  if (block) {
+    const b = [];
+    b.push(block.nodeOk ? "节点✓" : "节点✗");
+    if (block.directOk !== null && block.directOk !== undefined) {
+      b.push(block.directOk ? "本机✓" : "本机✗");
+    }
+    if (block.remoteOk !== null && block.remoteOk !== undefined) {
+      b.push(block.remoteOk ? "远端✓" : "远端✗");
+    }
+    blockLine =
+      '<div style="margin-top:10px;padding:10px 12px;border-radius:10px;background:#f2f2f7;font-size:13px;font-weight:600;line-height:1.4">' +
+      escapeHtml(b.join("  ") + " · " + shortConclusion(block.conclusion)) +
+      "</div>";
+  }
+
+  let warnLine = "";
+  if (warn.length) {
+    warnLine =
+      '<div style="margin-top:8px;font-size:12px;color:#8e8e93">⚠️ ' +
+      escapeHtml(truncate(warn[0], 40)) +
+      "</div>";
+  }
+
+  let nodeLine = POLICY
+    ? '<div style="margin-top:8px;font-size:12px;color:#8e8e93">📡 ' +
+      escapeHtml(truncate(POLICY, 32)) +
+      "</div>"
+    : "";
+
+  return (
+    '<div style="font-family:-apple-system;font-size:14px;line-height:1.4;text-align:left">' +
+    '<div style="padding:12px 14px;border-radius:12px;background:linear-gradient(135deg,' +
+    theme.color +
+    "22," +
+    theme.color +
+    '08)">' +
+    '<div style="font-size:11px;color:' +
+    theme.color +
+    ';font-weight:700">' +
+    escapeHtml(theme.titleEmoji + " " + theme.badge) +
+    "</div>" +
+    '<div style="margin-top:4px;font-size:20px;font-weight:800;white-space:pre-line;line-height:1.2">' +
+    escapeHtml(ipShow || "—") +
+    "</div></div>" +
+    (bits.length
+      ? '<div style="margin-top:12px;font-size:14px;font-weight:600;line-height:1.45">' +
+        escapeHtml(bits.join(" · ")) +
+        "</div>"
+      : "") +
+    (status.length
+      ? '<div style="margin-top:8px;font-size:13px;color:#3a3a3c;line-height:1.45">' +
+        escapeHtml(status.join(" · ")) +
+        "</div>"
+      : "") +
+    blockLine +
+    nodeLine +
+    warnLine +
+    "</div>"
   );
 }
 
@@ -1201,193 +1357,7 @@ function resultTheme(basic, risks, pure) {
   };
 }
 
-function buildHtml(basic, risks, pure, block, rtt, dns, libs, theme) {
-  const rows = [];
-  const ipShow =
-    (basic.v4 ? displayIP(basic.v4) : "") +
-    (basic.v4 && basic.v6 ? "\n" : "") +
-    (basic.v6 ? displayIP(basic.v6) : "");
 
-  rows.push(
-    '<div style="margin:0 0 12px;padding:12px;border-radius:12px;background:linear-gradient(135deg,' +
-      theme.color +
-      "22," +
-      theme.color +
-      '08)">' +
-      '<div style="font-size:11px;color:' +
-      theme.color +
-      ';font-weight:700">' +
-      escapeHtml(theme.titleEmoji + " " + theme.badge) +
-      "</div>" +
-      '<div style="margin-top:4px;font-size:20px;font-weight:800;white-space:pre-line;line-height:1.25">' +
-      escapeHtml(ipShow || "—") +
-      "</div></div>"
-  );
-
-  function row(em, lab, val, color) {
-    if (val == null || val === "") return;
-    rows.push(
-      '<div style="margin:0 0 9px"><div style="font-size:11px;color:#8e8e93">' +
-        escapeHtml(em + " " + lab) +
-        '</div><div style="margin-top:2px;font-size:14px;font-weight:600;color:' +
-        (color || "#1c1c1e") +
-        ';word-break:break-word;white-space:pre-wrap">' +
-        escapeHtml(String(val)) +
-        "</div></div>"
-    );
-  }
-
-  if (basic.v4) row("🌐", "IPv4", displayIP(basic.v4));
-  if (basic.v6) row("🧬", "IPv6", displayIP(basic.v6));
-  row("🏷️", "类型", basic.nature, theme.color);
-  if (basic.region) {
-    const img = basic.flagImg
-      ? '<img src="' +
-        escapeHtml(basic.flagImg) +
-        '" width="20" height="14" style="vertical-align:-2px;margin-right:5px;border-radius:2px"/>'
-      : "";
-    const text = String(basic.region || "")
-      .replace(/^(?:\uD83C[\uDDE6-\uDDFF]){2}\s*/g, "")
-      .trim();
-    rows.push(
-      '<div style="margin:0 0 9px"><div style="font-size:11px;color:#8e8e93">📍 地区</div>' +
-        '<div style="margin-top:2px;font-size:14px;font-weight:600">' +
-        img +
-        escapeHtml((basic.flagEmoji ? basic.flagEmoji + " " : "") + text) +
-        "</div></div>"
-    );
-  }
-  row("🏙️", "城市", basic.city);
-  row("🔢", "ASN", basic.asn);
-  row("🏢", "组织", basic.org);
-  row("🕐", "时区", basic.timezone);
-  if (POLICY) row("📡", "节点", POLICY);
-  if (rtt && rtt.ms != null) row("⚡", "延迟 RTT", rtt.ms + " ms");
-
-  if (dns) {
-    rows.push(sec("🧭 DNS 出口一致性"));
-    if (dns.httpIP) row("HTTP", "出口", dns.httpIP);
-    if (dns.dnsIP) row("DNS", "出口", dns.dnsIP);
-    row(
-      dns.level === "ok" ? "✅" : "🟠",
-      "结论",
-      dns.text,
-      dns.level === "ok" ? "#30D158" : "#FF9F0A"
-    );
-  }
-
-  if (pure) {
-    rows.push(sec("✨ IPPure 纯净度"));
-    row("🏠", "网络类型", pure.type);
-    if (pure.score !== null) {
-      row("📊", "欺诈值", pure.score + " 分 · " + pure.level);
-    }
-  }
-
-  rows.push(sec("🛡️ 风险"));
-  if (risks && risks.length) {
-    risks.forEach(function (r) {
-      const c =
-        r.level === "bad" ? "#FF453A" : r.level === "warn" ? "#FF9F0A" : "#30D158";
-      rows.push(
-        '<div style="margin:0 0 7px;font-size:13px"><span style="color:' +
-          c +
-          '">' +
-          escapeHtml(r.icon) +
-          "</span> <b>" +
-          escapeHtml(r.text) +
-          "</b></div>"
-      );
-    });
-  } else {
-    rows.push(
-      '<div style="color:#8e8e93;font-size:12px;margin-bottom:8px">⚪ 本次无可用标记</div>'
-    );
-  }
-
-  if (block) {
-    rows.push(sec("🔗 连通 / 阻断"));
-    row("节点", "代理", block.nodeOk ? "✅ 正常" : "❌ 不可达");
-    if (block.directOk !== null && block.directOk !== undefined) {
-      row("本机", "网络", block.directOk ? "✅ 正常" : "❌ 异常");
-    }
-    if (block.remoteOk !== null && block.remoteOk !== undefined) {
-      row("远端", "探测", block.remoteOk ? "✅ 可达" : "❌ 不可达");
-      if (block.remoteItems && block.remoteItems.length) {
-        let grid = "";
-        for (let i = 0; i < Math.min(block.remoteItems.length, 8); i += 2) {
-          const a = block.remoteItems[i];
-          const b = block.remoteItems[i + 1];
-          grid +=
-            '<div style="font-size:12px;font-family:Menlo,monospace;margin:2px 0">' +
-            escapeHtml(a.flag + " " + a.ms);
-          if (b) grid += "&emsp;" + escapeHtml(b.flag + " " + b.ms);
-          grid += "</div>";
-        }
-        rows.push(grid);
-      }
-    }
-    if (block.gpAnalysis && block.gpAnalysis.ispGroups) {
-      row("国内", "探测", "运营商采样");
-      const order = ["中国电信", "中国联通", "中国移动"];
-      const abbr = { 中国电信: "电信", 中国联通: "联通", 中国移动: "移动" };
-      order.forEach(function (k) {
-        const g = block.gpAnalysis.ispGroups[k];
-        if (!g) return;
-        g.probes.slice(0, 4).forEach(function (p) {
-          rows.push(
-            '<div style="font-size:12px;margin:2px 0">' +
-              escapeHtml((abbr[k] || k) + "·" + p.city) +
-              ' <span style="color:' +
-              (p.ok ? "#30D158" : "#FF453A") +
-              ';font-family:Menlo,monospace">' +
-              escapeHtml(p.ms) +
-              "</span></div>"
-          );
-        });
-      });
-    }
-    rows.push(
-      '<div style="margin-top:8px;padding:10px;border-radius:10px;background:#f2f2f7;font-weight:700;line-height:1.4">' +
-        escapeHtml(block.conclusion) +
-        "</div>"
-    );
-  }
-
-  if (libs && libs.ok && libs.ok.length) {
-    rows.push(sec("📚 数据源"));
-    rows.push(
-      '<div style="font-size:12px;color:#8e8e93">成功：' +
-        escapeHtml(libs.ok.join(" · ")) +
-        "</div>"
-    );
-  }
-
-  if (warn.length) {
-    rows.push(sec("💡 提示"));
-    warn.slice(0, 5).forEach(function (w) {
-      rows.push(
-        '<div style="color:#8e8e93;font-size:12px;margin:0 0 6px">⚠️ ' +
-          escapeHtml(w) +
-          "</div>"
-      );
-    });
-  }
-
-  return (
-    '<div style="font-family:-apple-system;font-size:14px;line-height:1.45;text-align:left">' +
-    rows.join("") +
-    "</div>"
-  );
-}
-
-function sec(t) {
-  return (
-    '<div style="margin:12px 0 8px;padding-top:10px;border-top:1px solid #e5e5ea;font-size:12px;font-weight:700;color:#8e8e93">' +
-    escapeHtml(t) +
-    "</div>"
-  );
-}
 
 // ── HTTP ─────────────────────────────────────────────────
 
