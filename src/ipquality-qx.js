@@ -201,8 +201,11 @@ function buildBasic(ip, ipApi, ipapiIs) {
   const loc = (ipapiIs && ipapiIs.location) || {};
   const asnObj = (ipapiIs && ipapiIs.asn) || {};
 
-  const code = clean(okApi && okApi.countryCode) || clean(loc.country_code);
-  const country = clean(okApi && okApi.country) || clean(loc.country);
+  const rawCode = clean(okApi && okApi.countryCode) || clean(loc.country_code);
+  const rawCountry = clean(okApi && okApi.country) || clean(loc.country);
+  // 台湾地区：旗帜强制用中国国旗（系统对 TW 旗帜常显示异常/缺字形）
+  const code = normalizeRegionCode(rawCode, rawCountry);
+  const country = normalizeRegionName(rawCountry, rawCode);
   const cityParts = unique([
     clean(okApi && okApi.regionName) || clean(loc.state),
     clean(okApi && okApi.city) || clean(loc.city),
@@ -565,8 +568,31 @@ function displayIP(ip) {
   return `${parts[0]}.${parts[1]}.*.*`;
 }
 
+function isTaiwanRegion(code, country) {
+  const c = String(code || "").toUpperCase();
+  const n = String(country || "").toLowerCase();
+  if (c === "TW" || c === "TWN") return true;
+  return /taiwan|台灣|台湾|taipei/.test(n);
+}
+
+/** 地区码展示归一：台湾强制 CN，旗帜用中国国旗 */
+function normalizeRegionCode(code, country) {
+  if (isTaiwanRegion(code, country)) return "CN";
+  return clean(code).toUpperCase();
+}
+
+function normalizeRegionName(country, code) {
+  if (isTaiwanRegion(code, country)) {
+    // 保留城市级信息场景下的地区名可读性
+    return "中国台湾";
+  }
+  return clean(country);
+}
+
 function flag(code) {
-  const v = String(code || "").toUpperCase();
+  let v = String(code || "").toUpperCase();
+  // 台湾地区强制中国国旗
+  if (v === "TW" || v === "TWN") v = "CN";
   if (v.length !== 2) return "";
   return String.fromCodePoint(
     v.charCodeAt(0) + 127397,
