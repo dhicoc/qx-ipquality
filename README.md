@@ -8,7 +8,7 @@
 
 ```ini
 [task_local]
-event-interaction https://raw.githubusercontent.com/dhicoc/qx-ipquality/master/src/ipquality-qx.js?v=20260720-62, tag=节点IP质量检测, img-url=shield.lefthalf.filled.system, enabled=true
+event-interaction https://raw.githubusercontent.com/dhicoc/qx-ipquality/master/src/ipquality-qx.js, tag=节点IP质量检测, img-url=shield.lefthalf.filled.system, enabled=true
 ```
 
 1. 保存配置，开启 **Tunnel**  
