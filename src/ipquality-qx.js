@@ -63,7 +63,7 @@ const warn = [];
 
   const [ipApi, ipapiIs] = await Promise.all([
     fetchJson(
-      `http://ip-api.com/json/${ip}?fields=status,message,country,countryCode,regionName,city,lat,lon,timezone,isp,org,as,asname,mobile,proxy,hosting,query`,
+      `http://ip-api.com/json/${ip}?lang=zh-CN&fields=status,message,country,countryCode,regionName,city,lat,lon,timezone,isp,org,as,asname,mobile,proxy,hosting,query`,
       { direct: true }
     ).catch((e) => {
       warn.push(`ip-api: ${err(e)}`);
@@ -203,9 +203,11 @@ function buildBasic(ip, ipApi, ipapiIs) {
 
   const rawCode = clean(okApi && okApi.countryCode) || clean(loc.country_code);
   const rawCountry = clean(okApi && okApi.country) || clean(loc.country);
-  // 台湾地区：旗帜强制用中国国旗（系统对 TW 旗帜常显示异常/缺字形）
-  const code = normalizeRegionCode(rawCode, rawCountry);
-  const country = normalizeRegionName(rawCountry, rawCode);
+  const taiwan = isTaiwanRegion(rawCode, rawCountry);
+  // 展示码：台湾统一 CN；旗帜按 I-am-R-E 逻辑生成（🇹🇼→🇨🇳 字面量）
+  const code = taiwan ? "CN" : clean(rawCode).toUpperCase();
+  const country = taiwan ? "中国台湾" : clean(rawCountry);
+  const flagEmoji = flagsEmoji(taiwan ? "TW" : rawCode);
   const cityParts = unique([
     clean(okApi && okApi.regionName) || clean(loc.state),
     clean(okApi && okApi.city) || clean(loc.city),
@@ -222,9 +224,14 @@ function buildBasic(ip, ipApi, ipapiIs) {
   return {
     ip,
     nature,
+    // 与 geo_location_checker 同款：🇨🇳 + 地区文案
     region: code
-      ? `${flag(code)} [${code.toUpperCase()}] ${country || ""}`.trim()
-      : country,
+      ? `${flagEmoji} [${code}] ${country || ""}`.trim()
+      : flagEmoji
+        ? `${flagEmoji} ${country || ""}`.trim()
+        : country,
+    flagEmoji,
+    flagImg: flagImageUrl(taiwan ? "CN" : code),
     city: cityParts.join(" · "),
     asn,
     org,
@@ -391,7 +398,9 @@ function buildResultHtml(basic, risks, warnings, theme, policy, fromUI) {
   const rows = [];
   rows.push(htmlHero(displayIP(basic.ip), theme));
   if (basic.nature) rows.push(htmlRow("🏷️", "类型", basic.nature, theme.color));
-  if (basic.region) rows.push(htmlRow("📍", "地区", basic.region));
+  if (basic.region) {
+    rows.push(htmlRegionRow(basic));
+  }
   if (basic.city) rows.push(htmlRow("🏙️", "城市", basic.city));
   if (basic.asn) rows.push(htmlRow("🔢", "ASN", basic.asn));
   if (basic.org) rows.push(htmlRow("🏢", "组织", basic.org));
@@ -569,34 +578,66 @@ function displayIP(ip) {
 }
 
 function isTaiwanRegion(code, country) {
-  const c = String(code || "").toUpperCase();
-  const n = String(country || "").toLowerCase();
+  const c = String(code || "").toUpperCase().replace(/[^A-Z]/g, "");
+  const n = String(country || "");
   if (c === "TW" || c === "TWN") return true;
-  return /taiwan|台灣|台湾|taipei/.test(n);
+  // 名称：中/英/繁及常见库写法
+  return /taiwan|twn|台灣|台湾|臺湾|中华民国|中華民國|taipei|台北|臺北/i.test(n);
 }
 
-/** 地区码展示归一：台湾强制 CN，旗帜用中国国旗 */
-function normalizeRegionCode(code, country) {
-  if (isTaiwanRegion(code, country)) return "CN";
-  return clean(code).toUpperCase();
+/**
+ * 国旗 emoji —— 对齐 I-am-R-E/Functional-Store-Hub IP-API.js
+ * 用 0x1f1a5 + charCode 生成，若得到 🇹🇼 则返回字面量 🇨🇳
+ * @see https://raw.githubusercontent.com/I-am-R-E/Functional-Store-Hub/Master/GeoLocationChecker/QuantumultX/IP-API.js
+ */
+function flagsEmoji(countryCode) {
+  const code = String(countryCode || "")
+    .toUpperCase()
+    .replace(/[^A-Z]/g, "");
+  // 无码时不猜；台湾在调用方会传入 "TW"
+  if (code.length !== 2) return "";
+
+  // 直接字面量：部分运行时 fromCodePoint 生成的旗帜无法正确比较/渲染
+  if (code === "TW") return "🇨🇳";
+  if (code === "CN") return "🇨🇳";
+
+  const emoji = String.fromCodePoint(
+    ...code.split("").map((ch) => 0x1f1a5 + ch.charCodeAt(0))
+  );
+  // 与参考仓库一致：Taiwanese flag becomes Chinese flag
+  if (emoji === "🇹🇼") return "🇨🇳";
+  return emoji;
 }
 
-function normalizeRegionName(country, code) {
-  if (isTaiwanRegion(code, country)) {
-    // 保留城市级信息场景下的地区名可读性
-    return "中国台湾";
-  }
-  return clean(country);
+/** HTML 面板用国旗图片（emoji 被系统屏蔽时仍可见） */
+function flagImageUrl(code) {
+  const c = String(code || "")
+    .toLowerCase()
+    .replace(/[^a-z]/g, "");
+  if (c.length !== 2) return "";
+  // 台湾同样用 cn 图
+  const iso = c === "tw" ? "cn" : c;
+  return `https://flagcdn.com/w40/${iso}.png`;
 }
 
-function flag(code) {
-  let v = String(code || "").toUpperCase();
-  // 台湾地区强制中国国旗
-  if (v === "TW" || v === "TWN") v = "CN";
-  if (v.length !== 2) return "";
-  return String.fromCodePoint(
-    v.charCodeAt(0) + 127397,
-    v.charCodeAt(1) + 127397
+function htmlRegionRow(basic) {
+  const img = basic.flagImg
+    ? `<img src="${escapeHtml(basic.flagImg)}" width="22" height="16" alt="" style="vertical-align:-2px;margin-right:6px;border-radius:2px;box-shadow:0 0 0 1px rgba(0,0,0,0.08)" />`
+    : "";
+  const emoji = basic.flagEmoji ? escapeHtml(basic.flagEmoji) + " " : "";
+  // 文案里去掉行首旗帜 emoji（前面已单独渲染图片+emoji）
+  // 区域指示符为代理对 \uD83C\uDDE6–\uDDFF，兼容旧 JS 引擎
+  const text = String(basic.region || "")
+    .replace(/^(?:\uD83C[\uDDE6-\uDDFF]){2}\s*/g, "")
+    .trim();
+  return (
+    `<div style="margin:0 0 10px 0">` +
+    `<div style="font-size:11px;color:#8e8e93">📍 地区</div>` +
+    `<div style="margin-top:2px;font-size:14px;font-weight:600;line-height:1.35;word-break:break-word">` +
+    img +
+    emoji +
+    escapeHtml(text) +
+    `</div></div>`
   );
 }
 
