@@ -12,11 +12,11 @@
  * @Updated: 2026-07-20
  */
 
-const VERSION = "2026-07-20.qx4.2";
+const VERSION = "2026-07-20.qx4.3";
 const UA =
   "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 Version/16.0 Mobile/15E148 Safari/604.1";
 const IPPURE_URL = "https://my.ippure.com/v1/info";
-const REQ_MS = 5000;
+const REQ_MS = 6000;
 const HARD_MS = 14000;
 
 const envVars =
@@ -115,25 +115,10 @@ async function main() {
     return;
   }
 
-  // ── 阶段 2：详情并行（各自限时）──────────────────────
+  // ── 阶段 2：详情并行（节点优先，直连兜底；各自限时）──
   const jobs = [
-    withTimeout(
-      fetchJson(
-        "http://ip-api.com/json/" +
-          egressIP +
-          "?lang=zh-CN&fields=status,message,country,countryCode,regionName,city,timezone,isp,org,as,asname,mobile,proxy,hosting,query",
-        { mode: "direct" }
-      ),
-      REQ_MS,
-      null
-    ),
-    withTimeout(
-      fetchJson("https://api.ipapi.is/?q=" + encodeURIComponent(egressIP), {
-        mode: "direct",
-      }),
-      REQ_MS,
-      null
-    ),
+    withTimeout(fetchIpApiDetail(egressIP), REQ_MS, null),
+    withTimeout(fetchIpapiIsDetail(egressIP), REQ_MS, null),
   ];
 
   if (PURE_ON && !ipure) {
@@ -156,7 +141,6 @@ async function main() {
     jobs.push(Promise.resolve(null));
   }
 
-  // full 才做远端（额外约 3s，可能顶满超时）
   if (BLOCK_MODE === "full" && POLICY) {
     jobs.push(
       withTimeout(
@@ -179,9 +163,13 @@ async function main() {
   const directOk = pack[3];
   const remote = pack[4];
 
-  if (!ipApi) warn.push("ip-api 详情未返回");
-  if (!ipapiIs) warn.push("ipapi.is 未返回");
+  // 有 IPPure/其它源补齐地理时，不把 ip-api 失败当用户可见错误
+  if (!ipApi) log("ip-api detail missing (may be blocked on direct)");
+  if (!ipapiIs) log("ipapi.is detail missing");
   if (PURE_ON && !pureData) warn.push("IPPure 未返回");
+  if (!ipApi && !ipapiIs && !pureData) {
+    warn.push("地理详情库均未返回，仅展示出口 IP");
+  }
 
   const basic = buildBasic(egressIP, ipApi, ipapiIs, pureData);
   const pure = buildPure(pureData);
@@ -301,6 +289,66 @@ function fetchIPPure() {
   return fetchJson(IPPURE_URL, { mode: "node" }).then(function (data) {
     if (!data || typeof data !== "object") throw new Error("IPPure 空");
     return data;
+  });
+}
+
+/** ip-api 详情：先走节点（国内直连常失败），再 direct / 默认路由 */
+function fetchIpApiDetail(ip) {
+  const url =
+    "http://ip-api.com/json/" +
+    encodeURIComponent(ip) +
+    "?lang=zh-CN&fields=status,message,country,countryCode,regionName,city,timezone,isp,org,as,asname,mobile,proxy,hosting,query";
+  return firstSuccess([
+    POLICY ? fetchJson(url, { mode: "node" }) : null,
+    fetchJson(url, { mode: "direct" }),
+    fetchJson(url, { mode: "auto" }),
+  ]).then(function (j) {
+    if (j && j.status === "success") return j;
+    // 部分环境返回无 status 但有 country
+    if (j && (j.country || j.countryCode || j.query)) return j;
+    return null;
+  });
+}
+
+function fetchIpapiIsDetail(ip) {
+  const url = "https://api.ipapi.is/?q=" + encodeURIComponent(ip);
+  return firstSuccess([
+    POLICY ? fetchJson(url, { mode: "node" }) : null,
+    fetchJson(url, { mode: "direct" }),
+    fetchJson(url, { mode: "auto" }),
+  ]).then(function (j) {
+    return j && typeof j === "object" ? j : null;
+  });
+}
+
+/** 多个请求谁先成功用谁 */
+function firstSuccess(promises) {
+  const list = (promises || []).filter(function (p) {
+    return p != null;
+  });
+  if (!list.length) return Promise.resolve(null);
+  return new Promise(function (resolve) {
+    let left = list.length;
+    let settled = false;
+    list.forEach(function (p) {
+      Promise.resolve(p).then(
+        function (v) {
+          if (settled) return;
+          if (v != null && v !== false) {
+            settled = true;
+            resolve(v);
+            return;
+          }
+          left -= 1;
+          if (left <= 0) resolve(null);
+        },
+        function () {
+          if (settled) return;
+          left -= 1;
+          if (left <= 0) resolve(null);
+        }
+      );
+    });
   });
 }
 
@@ -882,7 +930,7 @@ function fetchRaw(url, options) {
         method: String(opt.method || "GET").toUpperCase(),
         headers: opt.headers || {
           "User-Agent": UA,
-          Accept: "*/*",
+          Accept: "application/json,text/plain,*/*",
         },
       };
       if (opt.body != null) req.body = opt.body;
@@ -891,20 +939,17 @@ function fetchRaw(url, options) {
       $task.fetch(req).then(
         function (resp) {
           const code = Number(resp.statusCode);
+          const body = String(resp.body == null ? "" : resp.body);
+          // 有正文时放宽状态码，避免被中间页/奇怪状态挡住
           if (
             !opt.allowError &&
-            (!isFinite(code) || code < 200 || code >= 400)
+            (!isFinite(code) || code < 200 || code >= 400) &&
+            !body
           ) {
-            // 3xx 也当失败；允许 200-399 较宽松
-            if (!isFinite(code) || code < 200 || code >= 400) {
-              reject(new Error("HTTP " + (code || "?")));
-              return;
-            }
+            reject(new Error("HTTP " + (code || "?")));
+            return;
           }
-          resolve({
-            statusCode: code,
-            body: String(resp.body == null ? "" : resp.body),
-          });
+          resolve({ statusCode: code, body: body });
         },
         function (reason) {
           reject(
@@ -923,6 +968,7 @@ function fetchRaw(url, options) {
       return once(null);
     });
   }
+  // auto：不绑策略，走当前规则
   return once(null);
 }
 
