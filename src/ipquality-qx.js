@@ -135,28 +135,8 @@ const warn = [];
       : Promise.resolve(null),
   ]);
 
-  let gp = null;
-  if (
-    BLOCK_ON &&
-    !nodeOk === false &&
-    direct.ok &&
-    remote &&
-    remote.ok &&
-    !nodeOk
-  ) {
-    // unreachable - nodeOk is true here
-  }
-  // 节点代理失败且远端可达 → 国内运营商定位（与 block_check 一致）
-  // 此处 nodeOk 为 true；若将来 discover 与连通性分离再启用
-  // 补充：若出口 IP 拿到了但用户仍关心阻断，仅在「节点探测失败」路径走 GP
-  // 当 remote 失败且 node 成功：节点正常
-
-  // 若 IP 获取成功但我们想在「代理请求失败」场景走 GP——discover 已成功即代理通
-  // 阻断脚本的 node 失败指 ip-api via policy 失败；我们用 nodeOk=!!egressIP
-
-  if (BLOCK_ON && !nodeOk && direct.ok && remote && remote.ok && serverEP) {
-    gp = await runGlobalping(serverEP.host, serverEP.port).catch(() => null);
-  }
+  // 节点 HTTP 已通：不做 Globalping（阻断路径在上方 early-return 已处理）
+  const gp = null;
 
   const basic = buildBasic(egressIP, ipApi, ipapiIs, ipure);
   const risks = buildRisks(ipApi, ipapiIs, ipure);
