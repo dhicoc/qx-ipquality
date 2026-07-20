@@ -29,3 +29,7 @@
 - 原因：QX 不会读「列表点选」；应使用 UIAction：`$environment.params` = 长按节点 tag。
 - 修复：优先 `opts.policy = $environment.params`；长按用 htmlMessage 面板；文档改成长按用法。
 - 版本：`2026-07-19.qx3-ip`。
+
+### README 优化
+
+- 重写仓库 README：结构分层、安装/用法/参数/示例/FAQ/致谢/限制，与当前脚本能力对齐。
