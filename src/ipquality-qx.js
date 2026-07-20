@@ -79,57 +79,62 @@ const warn = [];
 
   const basic = buildBasic(ip, ipApi, ipapiIs);
   const risks = buildRisks(ipApi, ipapiIs);
+  const theme = resultTheme(basic, risks);
 
-  lines.push(`IP  ${displayIP(basic.ip)}`);
-  if (basic.nature) lines.push(`类型  ${basic.nature}`);
-  if (basic.region) lines.push(`地区  ${basic.region}`);
-  if (basic.city) lines.push(`城市  ${basic.city}`);
-  if (basic.asn) lines.push(`ASN  ${basic.asn}`);
-  if (basic.org) lines.push(`组织  ${basic.org}`);
-  if (basic.timezone) lines.push(`时区  ${basic.timezone}`);
-
-  if (FROM_UI && POLICY) {
-    lines.push(`节点  ${POLICY}`);
-  } else if (POLICY) {
-    lines.push(`策略  ${POLICY}`);
-  }
+  // 文本通知：行首 emoji 图标
+  lines.push(`🌐 IP　${displayIP(basic.ip)}`);
+  if (basic.nature) lines.push(`${theme.natureEmoji} 类型　${basic.nature}`);
+  if (basic.region) lines.push(`📍 地区　${basic.region}`);
+  if (basic.city) lines.push(`🏙️ 城市　${basic.city}`);
+  if (basic.asn) lines.push(`🔢 ASN　${basic.asn}`);
+  if (basic.org) lines.push(`🏢 组织　${basic.org}`);
+  if (basic.timezone) lines.push(`🕐 时区　${basic.timezone}`);
+  if (FROM_UI && POLICY) lines.push(`📡 节点　${POLICY}`);
+  else if (POLICY) lines.push(`📡 策略　${POLICY}`);
 
   if (risks.length) {
     lines.push("");
-    lines.push("· 风险");
-    risks.forEach((r) => lines.push(`  ${r}`));
+    lines.push("🛡️ 风险");
+    risks.forEach((r) => lines.push(`　${r.icon} ${r.text}`));
   } else {
     lines.push("");
-    lines.push("· 风险  本次无可用标记");
+    lines.push("🛡️ 风险　⚪ 本次无可用标记");
   }
 
   if (warn.length) {
     lines.push("");
-    lines.push("· 提示");
-    warn.slice(0, 5).forEach((w) => lines.push(`  ${w}`));
+    lines.push("💡 提示");
+    warn.slice(0, 5).forEach((w) => lines.push(`　⚠️ ${w}`));
   }
 
-  const title = "节点 IP 质量检测";
+  const title = `${theme.titleEmoji} 节点 IP 质量检测`;
   const subtitle = FROM_UI
     ? POLICY
     : POLICY
       ? `策略 · ${POLICY}`
       : "默认路由";
   const body = lines.join("\n");
+  const html = buildResultHtml(basic, risks, warn, theme, POLICY, FROM_UI);
 
-  // 长按节点时用面板展示；同时发通知便于复制
+  // 长按节点：HTML 面板 + SF Symbol 配图；同时通知
   if (FROM_UI) {
-    const html =
-      `<p style="text-align:left;font-family:-apple-system;font-size:14px;line-height:1.45;font-weight:normal;white-space:pre-wrap">` +
-      escapeHtml(body) +
-      `</p>`;
     $notify(title, subtitle, body);
-    $done({ title, htmlMessage: html });
+    $done({
+      title,
+      htmlMessage: html,
+      icon: theme.sfSymbol,
+      "icon-color": theme.color,
+    });
     return;
   }
 
   $notify(title, subtitle, body);
-  $done();
+  $done({
+    title,
+    htmlMessage: html,
+    icon: theme.sfSymbol,
+    "icon-color": theme.color,
+  });
 })().catch((e) => {
   fail(`异常: ${err(e)}`);
 });
@@ -278,8 +283,8 @@ function buildRisks(ipApi, ipapiIs) {
     if (okApi.mobile) flags.push("移动");
     out.push(
       flags.length
-        ? `ip-api  命中 ${flags.join("、")}`
-        : "ip-api  未命中 proxy/hosting"
+        ? riskItem("warn", `ip-api　命中 ${flags.join("、")}`)
+        : riskItem("ok", "ip-api　未命中 proxy/hosting")
     );
   }
 
@@ -293,21 +298,170 @@ function buildRisks(ipApi, ipapiIs) {
     if (ipapiIs.is_crawler) flags.push("爬虫");
     const score = ipapiIs.company && ipapiIs.company.abuser_score;
     const scoreText = clean(score) ? `评分 ${score}` : "";
+    const bad =
+      flags.length > 0 ||
+      (scoreText && /high|very high|elevated/i.test(String(score)));
     if (flags.length || scoreText) {
       out.push(
-        `ipapi.is  ${[
-          flags.length ? `命中 ${flags.join("、")}` : "无风险标记",
-          scoreText,
-        ]
-          .filter(Boolean)
-          .join(" · ")}`
+        riskItem(
+          bad ? "warn" : "ok",
+          `ipapi.is　${[
+            flags.length ? `命中 ${flags.join("、")}` : "无风险标记",
+            scoreText,
+          ]
+            .filter(Boolean)
+            .join(" · ")}`
+        )
       );
     } else {
-      out.push("ipapi.is  无风险标记");
+      out.push(riskItem("ok", "ipapi.is　无风险标记"));
     }
   }
 
   return out;
+}
+
+function riskItem(level, text) {
+  return {
+    level,
+    text,
+    icon: level === "warn" ? "🟠" : level === "bad" ? "🔴" : "🟢",
+  };
+}
+
+/** 结果主题：emoji + SF Symbol + 色值，用于面板配图 */
+function resultTheme(basic, risks) {
+  const nature = basic && basic.nature ? basic.nature : "";
+  const hasWarn = (risks || []).some((r) => r.level === "warn" || r.level === "bad");
+
+  if (nature.indexOf("机房") >= 0) {
+    return {
+      key: "hosting",
+      titleEmoji: "🖥️",
+      natureEmoji: "🖥️",
+      sfSymbol: "server.rack",
+      color: "#FF9F0A",
+      badge: "机房",
+    };
+  }
+  if (nature.indexOf("移动") >= 0) {
+    return {
+      key: "mobile",
+      titleEmoji: "📱",
+      natureEmoji: "📱",
+      sfSymbol: "antenna.radiowaves.left.and.right",
+      color: "#0A84FF",
+      badge: "移动",
+    };
+  }
+  if (nature.indexOf("代理") >= 0 || hasWarn) {
+    return {
+      key: "proxy",
+      titleEmoji: "🛡️",
+      natureEmoji: nature.indexOf("代理") >= 0 ? "🕵️" : "🏠",
+      sfSymbol: "network.badge.shield.half.filled",
+      color: hasWarn ? "#FF9F0A" : "#BF5AF2",
+      badge: nature.indexOf("代理") >= 0 ? "代理" : "关注",
+    };
+  }
+  if (nature.indexOf("家宽") >= 0) {
+    return {
+      key: "residential",
+      titleEmoji: "🏠",
+      natureEmoji: "🏠",
+      sfSymbol: "house.fill",
+      color: "#30D158",
+      badge: "家宽倾向",
+    };
+  }
+  return {
+    key: "default",
+    titleEmoji: "🌐",
+    natureEmoji: "🏷️",
+    sfSymbol: "shield.lefthalf.filled",
+    color: "#0A84FF",
+    badge: "检测完成",
+  };
+}
+
+function buildResultHtml(basic, risks, warnings, theme, policy, fromUI) {
+  const rows = [];
+  rows.push(htmlHero(displayIP(basic.ip), theme));
+  if (basic.nature) rows.push(htmlRow("🏷️", "类型", basic.nature, theme.color));
+  if (basic.region) rows.push(htmlRow("📍", "地区", basic.region));
+  if (basic.city) rows.push(htmlRow("🏙️", "城市", basic.city));
+  if (basic.asn) rows.push(htmlRow("🔢", "ASN", basic.asn));
+  if (basic.org) rows.push(htmlRow("🏢", "组织", basic.org));
+  if (basic.timezone) rows.push(htmlRow("🕐", "时区", basic.timezone));
+  if (policy) {
+    rows.push(htmlRow("📡", fromUI ? "节点" : "策略", policy));
+  }
+
+  rows.push(htmlSection("🛡️ 风险"));
+  if (risks && risks.length) {
+    risks.forEach((r) => {
+      rows.push(htmlRiskLine(r));
+    });
+  } else {
+    rows.push(htmlMuted("⚪ 本次无可用标记"));
+  }
+
+  if (warnings && warnings.length) {
+    rows.push(htmlSection("💡 提示"));
+    warnings.slice(0, 5).forEach((w) => {
+      rows.push(htmlMuted(`⚠️ ${w}`));
+    });
+  }
+
+  return (
+    `<div style="font-family:-apple-system,BlinkMacSystemFont,Helvetica;font-size:14px;line-height:1.45;text-align:left;color:#1c1c1e">` +
+    rows.join("") +
+    `</div>`
+  );
+}
+
+function htmlHero(ip, theme) {
+  return (
+    `<div style="margin:0 0 14px 0;padding:12px 14px;border-radius:12px;background:linear-gradient(135deg,${theme.color}22,${theme.color}08);border:1px solid ${theme.color}33">` +
+    `<div style="font-size:11px;color:${theme.color};font-weight:700;letter-spacing:0.4px">${escapeHtml(theme.titleEmoji + " " + theme.badge)}</div>` +
+    `<div style="margin-top:4px;font-size:22px;font-weight:800;letter-spacing:0.3px;line-height:1.2">${escapeHtml(ip)}</div>` +
+    `</div>`
+  );
+}
+
+function htmlRow(emoji, label, value, accent) {
+  const valueColor = accent || "#1c1c1e";
+  return (
+    `<div style="margin:0 0 10px 0">` +
+    `<div style="font-size:11px;color:#8e8e93">${escapeHtml(emoji + " " + label)}</div>` +
+    `<div style="margin-top:2px;font-size:14px;font-weight:600;color:${valueColor};word-break:break-word">${escapeHtml(value)}</div>` +
+    `</div>`
+  );
+}
+
+function htmlSection(title) {
+  return (
+    `<div style="margin:14px 0 8px 0;padding-top:10px;border-top:1px solid #e5e5ea;font-size:12px;font-weight:700;color:#8e8e93">` +
+    escapeHtml(title) +
+    `</div>`
+  );
+}
+
+function htmlRiskLine(risk) {
+  const color =
+    risk.level === "bad" ? "#FF453A" : risk.level === "warn" ? "#FF9F0A" : "#30D158";
+  return (
+    `<div style="margin:0 0 8px 0;font-size:13px;line-height:1.4">` +
+    `<span style="color:${color}">${escapeHtml(risk.icon)}</span> ` +
+    `<span style="font-weight:600">${escapeHtml(risk.text)}</span>` +
+    `</div>`
+  );
+}
+
+function htmlMuted(text) {
+  return (
+    `<div style="margin:0 0 8px 0;font-size:12px;color:#8e8e93;line-height:1.4">${escapeHtml(text)}</div>`
+  );
 }
 
 // ── HTTP ─────────────────────────────────────────────────
@@ -454,15 +608,17 @@ function log(msg) {
 }
 
 function fail(message) {
-  const title = "节点 IP 质量检测";
+  const title = "⚠️ 节点 IP 质量检测";
   $notify(title, "失败", message);
-  if (FROM_UI) {
-    const html =
-      `<p style="text-align:center;font-family:-apple-system;font-size:large">` +
-      escapeHtml(message) +
-      `</p>`;
-    $done({ title, htmlMessage: html });
-    return;
-  }
-  $done();
+  const html =
+    `<div style="font-family:-apple-system;text-align:center;padding:8px 4px">` +
+    `<div style="font-size:36px;line-height:1.2">⚠️</div>` +
+    `<div style="margin-top:10px;font-size:15px;font-weight:600;color:#FF453A;line-height:1.4">${escapeHtml(message)}</div>` +
+    `</div>`;
+  $done({
+    title,
+    htmlMessage: html,
+    icon: "exclamationmark.triangle.fill",
+    "icon-color": "#FF453A",
+  });
 }
