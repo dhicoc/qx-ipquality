@@ -1,16 +1,16 @@
 /**
  * 节点 IP 质量检测 · Quantumult X
  *
- * 出口 IPv4/IPv6 · IPPure · 多库风险 · DNS 一致性 · RTT
- * 已去除 block_check（check-host / Globalping / 阻断诊断）
+ * 出口 IPv4/IPv6 · IPPure · 多库风险 · RTT
+ * 已去除：block_check、DNS/DoH 探测
  *
  * 长按节点运行。
- * 参数：mask=0 pure=1 dns=1 rtt=1 v6=1
+ * 参数：mask=0 pure=1 rtt=1 v6=1
  *
  * @Updated: 2026-07-20
  */
 
-const VERSION = "2026-07-20.qx6.1";
+const VERSION = "2026-07-20.qx6.2";
 const UA =
   "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 Version/16.0 Mobile/15E148 Safari/604.1";
 const IPPURE_URL = "https://my.ippure.com/v1/info";
@@ -29,7 +29,6 @@ const args = Object.assign({}, envVars, parseArgument(argRaw));
 const POLICY = resolvePolicy();
 const MASK_IP = isTruthy(args.mask, false);
 const PURE_ON = isTruthy(args.pure, true);
-const DNS_ON = isTruthy(args.dns, true);
 const RTT_ON = isTruthy(args.rtt, true);
 const V6_ON = isTruthy(args.v6, true);
 
@@ -54,8 +53,6 @@ async function main() {
       (POLICY || "(默认)") +
       " pure=" +
       PURE_ON +
-      " dns=" +
-      DNS_ON +
       " rtt=" +
       RTT_ON +
       " v6=" +
@@ -63,20 +60,18 @@ async function main() {
   );
   if (!POLICY) warn.push("未指定节点：走默认路由。请长按目标节点");
 
-  // 阶段 1：出口 / 纯净 / 延迟 / DNS
+  // 阶段 1：出口 / 纯净 / 延迟
   const p1 = await Promise.all([
     withTimeout(discoverIPv4(), 6500, ""),
     V6_ON ? withTimeout(discoverIPv6(), 6500, "") : Promise.resolve(""),
     PURE_ON ? withTimeout(fetchIPPure(), REQ_MS, null) : Promise.resolve(null),
     RTT_ON ? withTimeout(measureRTT(), 4000, null) : Promise.resolve(null),
-    DNS_ON ? withTimeout(probeDnsExit(), 5000, null) : Promise.resolve(null),
   ]);
 
   let v4 = p1[0] || "";
   const v6 = p1[1] || "";
   let ipure = p1[2];
   const rtt = p1[3];
-  const dnsInfo = p1[4];
 
   if (!v4 && ipure) v4 = normalizeIP(ipure.ip) || "";
   if (!v4 && !v6) {
@@ -127,10 +122,9 @@ async function main() {
   const basic = buildBasic(v4, v6, ipApi, ipapiIs, ipure, ipinfo, ipwho);
   const pure = buildPure(ipure);
   const risks = buildRisks(ipApi, ipapiIs, ipure, ipinfo, ipwho);
-  const dnsReport = buildDnsReport(v4, v6, dnsInfo);
   const theme = resultTheme(basic, pure);
 
-  renderAll(basic, risks, pure, rtt, dnsReport, theme);
+  renderAll(basic, risks, pure, rtt, theme);
 }
 
 // ── Policy ───────────────────────────────────────────────
@@ -242,137 +236,13 @@ function extractIPv6(text) {
   return m[1].indexOf(":") >= 0 ? m[1] : "";
 }
 
-// ── RTT / DoH 探测 ───────────────────────────────────────
-// 说明：
-//   「HTTP 落地」= 经节点访问 ipify 等看到的公网 IP（节点落地 IP）
-//   「DoH 探测」= 经同一节点访问 DoH whoami 看到的 IP
-//   两者都走代理 HTTP(S)，不是手机系统 DNS 泄漏检测；
-//   一致=代理出口稳定；DoH 失败=whoami 接口不可用（常见）。
+// ── RTT ──────────────────────────────────────────────────
 
 function measureRTT() {
   const t0 = Date.now();
   return fetchRaw(RTT_URL, { mode: "node", allowError: true }).then(function () {
     return { ms: Date.now() - t0 };
   });
-}
-
-function probeDnsExit() {
-  // 多后端竞速：Google whoami 比 CF whoami 更常返回真实 IP
-  return firstSuccess([
-    probeGoogleMyAddr(),
-    probeCfWhoamiDoh(),
-    probeOpenDnsMyIp(),
-  ]).then(function (hit) {
-    return hit || { ip: "", source: "" };
-  });
-}
-
-/** Google: o-o.myaddr.l.google.com TXT */
-function probeGoogleMyAddr() {
-  const url =
-    "https://dns.google/resolve?name=o-o.myaddr.l.google.com&type=TXT";
-  return fetchJson(url, {
-    mode: "node",
-    headers: { Accept: "application/json", "User-Agent": UA },
-  }).then(function (j) {
-    const ip = pickIpFromDnsAnswers(j && j.Answer);
-    if (!ip || ip === "0.0.0.0") throw new Error("google whoami empty");
-    return { ip: ip, source: "google-doh" };
-  });
-}
-
-/** Cloudflare DoH whoami（部分环境会 0.0.0.0） */
-function probeCfWhoamiDoh() {
-  const url =
-    "https://cloudflare-dns.com/dns-query?name=whoami.cloudflare&type=TXT";
-  return fetchJson(url, {
-    mode: "node",
-    headers: { Accept: "application/dns-json", "User-Agent": UA },
-  }).then(function (j) {
-    const ip = pickIpFromDnsAnswers(j && j.Answer);
-    if (!ip || ip === "0.0.0.0") throw new Error("cf whoami empty");
-    return { ip: ip, source: "cf-doh" };
-  });
-}
-
-/** OpenDNS myip（A 记录） */
-function probeOpenDnsMyIp() {
-  const url = "https://dns.google/resolve?name=myip.opendns.com&type=A";
-  // 注意：经 Google 解析 OpenDNS 主机名，得到的是该域名 A 记录，不一定是客户端 IP
-  // 改用 Cloudflare trace 作最后兜底（本质 HTTP 落地，仅作备用展示）
-  return fetchText("https://cloudflare.com/cdn-cgi/trace", { mode: "node" }).then(
-    function (body) {
-      const m = String(body).match(/^ip=([^\r\n]+)/m);
-      const ip = m ? String(m[1]).trim() : "";
-      if (!ip || ip === "0.0.0.0") throw new Error("trace empty");
-      // 标记为 http-trace，展示时说明与 HTTP 同源
-      return { ip: ip, source: "http-trace" };
-    }
-  );
-}
-
-function pickIpFromDnsAnswers(answers) {
-  const ans = answers || [];
-  for (let i = 0; i < ans.length; i++) {
-    let data = String(ans[i].data || "");
-    // "\"1.2.3.4\"" 或 "1.2.3.4"
-    data = data.replace(/\\/g, "").replace(/"/g, "").trim();
-    // 有的带前缀 edns0-client-subnet=...
-    const parts = data.split(/\s+/);
-    for (let j = 0; j < parts.length; j++) {
-      const v4 = normalizeIP(parts[j]);
-      if (v4 && v4 !== "0.0.0.0") return v4;
-      if (parts[j].indexOf(":") >= 0) {
-        const v6 = extractIPv6(parts[j]);
-        if (v6) return v6;
-      }
-    }
-    const v4b = extractIPv4(data);
-    if (v4b && v4b !== "0.0.0.0") return v4b;
-  }
-  return "";
-}
-
-function buildDnsReport(v4, v6, dnsInfo) {
-  if (!dnsInfo) return null;
-  const probeIP = clean(dnsInfo.ip);
-  const httpIP = v4 || v6 || "";
-  const source = dnsInfo.source || "";
-
-  if (!probeIP) {
-    return {
-      httpIP: displayIP(httpIP),
-      dnsIP: "",
-      source: "",
-      text: "DoH 未测到（不影响 HTTP 落地 IP）",
-      level: "unknown",
-    };
-  }
-
-  // http-trace 与 HTTP 落地同源，不算真正的 DNS 旁路对比
-  if (source === "http-trace") {
-    const sameTrace = probeIP === v4 || probeIP === v6;
-    return {
-      httpIP: displayIP(httpIP),
-      dnsIP: displayIP(probeIP),
-      source: source,
-      text: sameTrace
-        ? "备用探测成功（HTTP trace，与落地同源）"
-        : "备用探测 IP 与落地不同",
-      level: sameTrace ? "ok" : "warn",
-    };
-  }
-
-  const same = probeIP === v4 || probeIP === v6 || probeIP === httpIP;
-  return {
-    httpIP: displayIP(httpIP),
-    dnsIP: displayIP(probeIP),
-    source: source,
-    text: same
-      ? "DoH 与 HTTP 落地一致"
-      : "DoH 与 HTTP 落地不一致（出口不稳定或分流）",
-    level: same ? "ok" : "warn",
-  };
 }
 
 // ── 多库 ─────────────────────────────────────────────────
@@ -661,13 +531,11 @@ function buildRisks(ipApi, ipapiIs, ipure, ipinfo, ipwho) {
 
 // ── 渲染（适中详细，非极简）──────────────────────────────
 
-function renderAll(basic, risks, pure, rtt, dns, theme) {
-  // IP
+function renderAll(basic, risks, pure, rtt, theme) {
   if (basic.v4) lines.push("IPv4  " + displayIP(basic.v4));
   if (basic.v6) lines.push("IPv6  " + displayIP(basic.v6));
   if (!basic.v4 && !basic.v6) lines.push("IP  未获取");
 
-  // 基础信息
   if (basic.nature) lines.push("类型  " + basic.nature);
   if (basic.region) lines.push("地区  " + basic.region);
   if (basic.city) lines.push("城市  " + basic.city);
@@ -680,36 +548,18 @@ function renderAll(basic, risks, pure, rtt, dns, theme) {
   if (POLICY) lines.push("节点  " + POLICY);
   if (rtt && rtt.ms != null) lines.push("延迟  " + rtt.ms + " ms");
 
-  // 纯净度
   if (pure) {
     lines.push("");
     lines.push("纯净度");
-    lines.push("  " + pure.type + (pure.score !== null ? " · 欺诈值 " + pure.score + "（" + pure.level + "）" : ""));
-  }
-
-  // HTTP 落地 vs DoH 探测
-  if (dns) {
-    lines.push("");
-    lines.push("出口对比");
-    if (dns.httpIP) lines.push("  HTTP落地  " + dns.httpIP + "（经节点）");
-    if (dns.dnsIP) {
-      lines.push(
-        "  DoH探测   " +
-          dns.dnsIP +
-          (dns.source ? "（" + shortDnsSource(dns.source) + "）" : "")
-      );
-    } else {
-      lines.push("  DoH探测   未测到");
-    }
     lines.push(
       "  " +
-        (dns.level === "ok" ? "✅" : dns.level === "warn" ? "🟠" : "⚪") +
-        " " +
-        dns.text
+        pure.type +
+        (pure.score !== null
+          ? " · 欺诈值 " + pure.score + "（" + pure.level + "）"
+          : "")
     );
   }
 
-  // 风险
   if (risks && risks.length) {
     lines.push("");
     lines.push("风险");
@@ -728,7 +578,7 @@ function renderAll(basic, risks, pure, rtt, dns, theme) {
     theme.titleEmoji + " 节点 IP 检测",
     POLICY || "完成",
     body,
-    buildHtml(basic, risks, pure, rtt, dns, theme),
+    buildHtml(basic, risks, pure, rtt, theme),
     theme
   );
 }
@@ -761,7 +611,7 @@ function resultTheme(basic, pure) {
   };
 }
 
-function buildHtml(basic, risks, pure, rtt, dns, theme) {
+function buildHtml(basic, risks, pure, rtt, theme) {
   const rows = [];
   const ipShow =
     (basic.v4 ? displayIP(basic.v4) : "") +
@@ -815,18 +665,6 @@ function buildHtml(basic, risks, pure, rtt, dns, theme) {
     );
   }
 
-  if (dns) {
-    rows.push(sec("出口对比"));
-    row("HTTP落地", dns.httpIP ? dns.httpIP + "（经节点）" : "");
-    row(
-      "DoH探测",
-      dns.dnsIP
-        ? dns.dnsIP + (dns.source ? "（" + shortDnsSource(dns.source) + "）" : "")
-        : "未测到"
-    );
-    row("结论", dns.text);
-  }
-
   if (risks && risks.length) {
     rows.push(sec("风险"));
     risks.forEach(function (r) {
@@ -865,13 +703,6 @@ function sec(t) {
     escapeHtml(t) +
     "</div>"
   );
-}
-
-function shortDnsSource(s) {
-  if (s === "google-doh") return "Google DoH";
-  if (s === "cf-doh") return "CF DoH";
-  if (s === "http-trace") return "HTTP备用";
-  return s || "";
 }
 
 // ── HTTP ─────────────────────────────────────────────────
