@@ -66,7 +66,7 @@ event-interaction https://raw.githubusercontent.com/dhicoc/qx-ipquality/master/s
 | `policy` / `node` | 空 | 写死节点或策略组名 |
 | `mask` | `0` | `1` 隐藏 IP 后两段 |
 | `pure` | `1` | `0` 关闭 IPPure |
-| `block` | `1` | `0` 关闭阻断/远端探测 |
+| `block` | `0` | `1` 开启阻断/远端探测（更慢） |
 
 示例：
 
@@ -111,9 +111,11 @@ argument=mask=1&pure=1&block=1
 
 | 模式 | 大约耗时 |
 |------|----------|
-| `block=0` | 约 3～8 秒 |
-| `block=1` 且节点正常 | 约 6～12 秒（含 check-host 等待） |
-| 节点代理失败且触发 Globalping | 约 15～20 秒 |
+| 默认（`block=0`） | 约 3～8 秒（推荐） |
+| `block=1` 且节点正常 | 约 8～15 秒 |
+| 节点失败 + Globalping | 约 15～18 秒（脚本 18s 硬超时） |
+
+若面板提示「无有效内容」：请更新到最新脚本，确认 Tunnel 已开并 **长按节点** 运行；仍失败时用 `argument=block=0`。
 
 ---
 

@@ -1,38 +1,34 @@
 /**
  * 节点 IP 质量检测 · Quantumult X
  *
- * 整合：
- * - 本仓库原有：出口 IP / 地区 ASN / 多源风险 / 图标面板
- * - IPPure 纯净度（参考 ddgksf2013 server-info-pure）
- * - 节点阻断诊断（参考 RavelloH block_check）
- *
+ * 功能：出口 IP + IPPure 纯净度 + 可选连通/阻断诊断
  * 用法：长按节点 → 本脚本
- * 备选：argument=policy=节点名&mask=0&pure=1&block=1
+ * 参数：mask=0&pure=1&block=1
+ *
+ * 若曾出现「无有效内容」：多为脚本超时未 $done 或配置 API 挂起。
+ * 本版强制总超时收尾，并给配置读取加超时。
  *
  * @Updated: 2026-07-20
  */
 
-const VERSION = "2026-07-20.qx4";
+const VERSION = "2026-07-20.qx4.1";
 const UA =
   "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 Version/16.0 Mobile/15E148 Safari/604.1";
 const IPPURE_URL = "https://my.ippure.com/v1/info";
-const IP_API = "http://ip-api.com/json?lang=zh-CN";
+const IP_API_BASE = "http://ip-api.com/json";
 const CHECK_HOST = "https://check-host.net";
 const GP_API = "https://api.globalping.io/v1/measurements";
-const TIMEOUT = 8000;
+const HARD_LIMIT_MS = 18000;
 
 const envVars =
   typeof $environment !== "undefined" && $environment.variables
     ? $environment.variables
     : {};
 const argRaw =
-  typeof $argument !== "undefined" && $argument !== null ? String($argument) : "";
+  typeof $argument !== "undefined" && $argument != null ? String($argument) : "";
 const args = Object.assign({}, envVars, parseArgument(argRaw));
 
-const UI_NODE =
-  typeof $environment !== "undefined" && $environment.params
-    ? clean(String($environment.params))
-    : "";
+const UI_NODE = readUINode();
 const ARG_POLICY = clean(args.policy || args.node || "");
 const BARE_POLICY =
   !ARG_POLICY && argRaw && argRaw.indexOf("=") < 0 ? clean(argRaw) : "";
@@ -40,207 +36,247 @@ const POLICY = UI_NODE || ARG_POLICY || BARE_POLICY;
 const FROM_UI = !!UI_NODE;
 const MASK_IP = isTruthy(args.mask, false);
 const PURE_ON = isTruthy(args.pure, true);
-const BLOCK_ON = isTruthy(args.block, true);
+// 默认关闭远端 TCP（最易超时）；需要时 argument=block=1
+const BLOCK_ON = isTruthy(args.block, false);
 
 const lines = [];
 const warn = [];
+let finished = false;
 
-(async () => {
-  log(`start ${VERSION} policy=${POLICY || "(默认)"} pure=${PURE_ON} block=${BLOCK_ON}`);
+// 总超时：保证一定有返回
+setTimeout(function () {
+  if (!finished) {
+    fail("检测超时（可改 argument=block=0 或检查 Tunnel/节点名）");
+  }
+}, HARD_LIMIT_MS);
+
+main().catch(function (e) {
+  fail("异常: " + err(e));
+});
+
+async function main() {
+  log(
+    "start " +
+      VERSION +
+      " policy=" +
+      (POLICY || "(默认)") +
+      " pure=" +
+      PURE_ON +
+      " block=" +
+      BLOCK_ON
+  );
 
   if (!POLICY) {
-    warn.push(
-      "未指定节点：测的是当前默认路由。请长按目标节点，或 argument=policy=完整节点名"
-    );
+    warn.push("未指定节点：走默认路由。请长按目标节点再运行");
   }
 
-  // 并行：出口 IP、IPPure、本机直连、节点 host:port
-  const [ip, ipure, direct, serverEP] = await Promise.all([
-    discoverIP().catch((e) => {
-      warn.push(`出口探测: ${err(e)}`);
-      return "";
-    }),
-    PURE_ON
-      ? fetchIPPure().catch((e) => {
-          warn.push(`IPPure: ${err(e)}`);
-          return null;
-        })
-      : Promise.resolve(null),
-    BLOCK_ON
-      ? checkDirectNet().catch(() => ({ ok: false }))
-      : Promise.resolve({ ok: null }),
+  // ① 核心：出口 + 纯净度（必须在数秒内出结果）
+  const core = await Promise.all([
+    safe(discoverIP(), ""),
+    PURE_ON ? safe(fetchIPPure(), null) : Promise.resolve(null),
+    BLOCK_ON ? safe(checkDirectNet(), { ok: null }) : Promise.resolve({ ok: null }),
     BLOCK_ON && POLICY
-      ? getServerHostPort(POLICY).catch(() => null)
+      ? safe(withTimeout(getServerHostPort(POLICY), 2500, null), null)
       : Promise.resolve(null),
   ]);
 
-  // IPPure 也可作为出口 IP 兜底
+  const ip = core[0];
+  const ipure = core[1];
+  const direct = core[2] || { ok: null };
+  const serverEP = core[3];
+
   const egressIP = ip || normalizeIP(ipure && ipure.ip) || "";
-  const nodeOk = !!egressIP;
 
   if (!egressIP) {
-    // 仍尝试出阻断结论（节点完全不通）
     if (BLOCK_ON && POLICY) {
       const remote = serverEP
-        ? await checkHostRemote(serverEP.host, serverEP.port).catch(() => ({
+        ? await safe(checkHostRemote(serverEP.host, serverEP.port), {
             ok: false,
             error: "远端探测失败",
-          }))
-        : { ok: false, error: "无节点地址" };
+            items: [],
+          })
+        : { ok: false, error: "无节点地址", items: [] };
       let gp = null;
       if (direct.ok && remote.ok && serverEP) {
-        gp = await runGlobalping(serverEP.host, serverEP.port).catch(() => null);
+        gp = await safe(runGlobalping(serverEP.host, serverEP.port), null);
       }
       const block = buildBlockReport({
         nodeOk: false,
-        directOk: !!direct.ok,
-        remote,
-        gp,
+        directOk: direct.ok === true,
+        remote: remote,
+        gp: gp,
         nodeIp: "",
         nodeLoc: "",
-        nodeIsp: "",
       });
-      finishWithBlockOnly(block);
+      renderFailureWithBlock(block);
       return;
     }
     fail(
       POLICY
-        ? `无法经「${POLICY}」获取出口 IP（节点名是否一致？Tunnel 是否开启？）`
-        : "无法获取出口 IP（请检查网络 / Tunnel）"
+        ? "无法经「" + POLICY + "」获取出口 IP（检查节点名 / Tunnel）"
+        : "无法获取出口 IP（检查网络 / Tunnel）"
     );
     return;
   }
 
-  // 并行：详情库 + 远端 TCP（可选）
-  const [ipApi, ipapiIs, remote] = await Promise.all([
-    fetchJson(
-      `http://ip-api.com/json/${egressIP}?lang=zh-CN&fields=status,message,country,countryCode,regionName,city,lat,lon,timezone,isp,org,as,asname,mobile,proxy,hosting,query`,
-      { direct: true, timeout: TIMEOUT }
-    ).catch((e) => {
-      warn.push(`ip-api: ${err(e)}`);
-      return null;
-    }),
-    fetchJson(`https://api.ipapi.is/?q=${encodeURIComponent(egressIP)}`, {
-      direct: true,
-      timeout: TIMEOUT,
-    }).catch((e) => {
-      warn.push(`ipapi.is: ${err(e)}`);
-      return null;
-    }),
+  // ② 详情库（直连查 IP，失败不影响出结果）
+  const detail = await Promise.all([
+    safe(
+      fetchJson(
+        IP_API_BASE +
+          "/" +
+          egressIP +
+          "?lang=zh-CN&fields=status,message,country,countryCode,regionName,city,lat,lon,timezone,isp,org,as,asname,mobile,proxy,hosting,query",
+        { mode: "direct" }
+      ),
+      null
+    ),
+    safe(
+      fetchJson("https://api.ipapi.is/?q=" + encodeURIComponent(egressIP), {
+        mode: "direct",
+      }),
+      null
+    ),
     BLOCK_ON && serverEP
-      ? checkHostRemote(serverEP.host, serverEP.port).catch(() => ({
+      ? safe(checkHostRemote(serverEP.host, serverEP.port), {
           ok: false,
           error: "远端探测失败",
-        }))
+          items: [],
+        })
       : Promise.resolve(null),
   ]);
 
-  // 节点 HTTP 已通：不做 Globalping（阻断路径在上方 early-return 已处理）
-  const gp = null;
+  const ipApi = detail[0];
+  const ipapiIs = detail[1];
+  const remote = detail[2];
+
+  if (!ipApi) warn.push("ip-api 详情未返回");
+  if (!ipapiIs) warn.push("ipapi.is 未返回");
+  if (PURE_ON && !ipure) warn.push("IPPure 未返回");
 
   const basic = buildBasic(egressIP, ipApi, ipapiIs, ipure);
-  const risks = buildRisks(ipApi, ipapiIs, ipure);
   const pure = buildPure(ipure);
+  const risks = buildRisks(ipApi, ipapiIs, ipure);
   const block = BLOCK_ON
     ? buildBlockReport({
         nodeOk: true,
         directOk: direct.ok === null ? null : !!direct.ok,
-        remote,
-        gp,
+        remote: remote,
+        gp: null,
         nodeIp: displayIP(egressIP),
         nodeLoc: basic.region || basic.city || "",
-        nodeIsp: basic.org || "",
       })
     : null;
 
   const theme = resultTheme(basic, risks, pure);
   renderAll(basic, risks, pure, block, theme);
-})().catch((e) => {
-  fail(`异常: ${err(e)}`);
-});
+}
+
+// ── 读取长按节点 ─────────────────────────────────────────
+
+function readUINode() {
+  try {
+    if (typeof $environment === "undefined" || $environment.params == null) {
+      return "";
+    }
+    const p = $environment.params;
+    if (typeof p === "string") return clean(p);
+    if (typeof p === "object") {
+      // 兼容偶发对象形态
+      return clean(p.node || p.policy || p.name || p.tag || "");
+    }
+    return clean(String(p));
+  } catch (e) {
+    return "";
+  }
+}
 
 // ── 出口 / 纯净 / 阻断 ───────────────────────────────────
 
 async function discoverIP() {
   const probes = [
-    {
-      name: "ipify",
-      run: () =>
-        fetchJson("https://api4.ipify.org?format=json", { timeout: 6000 }).then(
-          (j) => j && j.ip
-        ),
+    function () {
+      return fetchJson("https://api4.ipify.org?format=json", {
+        mode: "node",
+      }).then(function (j) {
+        return j && j.ip;
+      });
     },
-    {
-      name: "ip-api",
-      run: () =>
-        fetchJson(`${IP_API}&fields=status,query`, { timeout: 6000 }).then(
-          (j) => j && j.status === "success" && j.query
-        ),
+    function () {
+      return fetchJson(IP_API_BASE + "?lang=zh-CN&fields=status,query", {
+        mode: "node",
+      }).then(function (j) {
+        return j && j.status === "success" && j.query;
+      });
     },
-    {
-      name: "icanhazip",
-      run: () =>
-        fetchText("https://ipv4.icanhazip.com/", { timeout: 6000 }).then(
-          (t) => t && t.trim()
-        ),
+    function () {
+      return fetchText("https://ipv4.icanhazip.com/", { mode: "node" }).then(
+        function (t) {
+          return t && String(t).trim();
+        }
+      );
     },
   ];
 
-  const results = await Promise.all(
-    probes.map((p) =>
-      p
-        .run()
-        .then((v) => ({ name: p.name, ip: normalizeIP(v) }))
-        .catch((e) => {
-          log(`probe ${p.name}: ${err(e)}`);
-          return { name: p.name, ip: "" };
+  const settled = await Promise.all(
+    probes.map(function (run, idx) {
+      return run()
+        .then(function (v) {
+          return { name: "p" + idx, ip: normalizeIP(v) };
         })
-    )
+        .catch(function (e) {
+          log("probe " + idx + ": " + err(e));
+          return { name: "p" + idx, ip: "" };
+        });
+    })
   );
 
-  const valid = results.filter((r) => r.ip);
+  const valid = settled.filter(function (r) {
+    return r.ip;
+  });
   if (!valid.length) return "";
 
   const counts = {};
-  valid.forEach((r) => {
+  valid.forEach(function (r) {
     counts[r.ip] = (counts[r.ip] || 0) + 1;
   });
-  const ranked = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);
+  const ranked = Object.keys(counts).sort(function (a, b) {
+    return counts[b] - counts[a];
+  });
   if (ranked.length > 1) {
     warn.push(
-      `出口不一致: ${valid.map((r) => `${r.name}=${r.ip}`).join(", ")}`
+      "出口不一致: " +
+        valid
+          .map(function (r) {
+            return r.name + "=" + r.ip;
+          })
+          .join(", ")
     );
   }
   return ranked[0];
 }
 
-/** IPPure：走节点出口探测纯净度（server-info-pure） */
-async function fetchIPPure() {
-  const data = await fetchJson(IPPURE_URL, {
-    timeout: 5000,
-    headers: { "User-Agent": UA },
+function fetchIPPure() {
+  return fetchJson(IPPURE_URL, { mode: "node" }).then(function (data) {
+    if (!data || typeof data !== "object") throw new Error("IPPure 空响应");
+    return data;
   });
-  if (!data || typeof data !== "object") throw new Error("空响应");
-  return data;
 }
 
-/** 本机直连是否正常（block_check） */
-async function checkDirectNet() {
-  try {
-    const j = await fetchJson(`${IP_API}&fields=status,query`, {
-      direct: true,
-      timeout: TIMEOUT,
-      forceNoPolicy: true,
+function checkDirectNet() {
+  return fetchJson(IP_API_BASE + "?lang=zh-CN&fields=status,query", {
+    mode: "direct",
+  })
+    .then(function (j) {
+      return { ok: !!(j && j.status === "success") };
+    })
+    .catch(function () {
+      return { ok: false };
     });
-    return { ok: !!(j && j.status === "success") };
-  } catch (_) {
-    return { ok: false };
-  }
 }
 
-/** 从 QX 取节点 server host:port */
 function getServerHostPort(tag) {
-  return new Promise((resolve) => {
+  return new Promise(function (resolve) {
     if (
       !tag ||
       typeof $configuration === "undefined" ||
@@ -249,123 +285,122 @@ function getServerHostPort(tag) {
       resolve(null);
       return;
     }
-    $configuration
-      .sendMessage({ action: "get_server_description", content: tag })
-      .then(
-        (msg) => {
-          try {
-            const desc =
-              msg && msg.ret && msg.ret[tag] ? String(msg.ret[tag]) : "";
-            const eq = desc.indexOf("=");
-            if (eq < 0) {
-              resolve(null);
-              return;
-            }
-            const after = desc.slice(eq + 1);
-            const comma = after.indexOf(",");
-            const hp = comma < 0 ? after : after.slice(0, comma);
-            const colon = hp.lastIndexOf(":");
-            if (colon < 0) {
-              resolve(null);
-              return;
-            }
-            const host = hp.slice(0, colon).trim();
-            const port = hp.slice(colon + 1).trim();
-            if (!host || !port) {
-              resolve(null);
-              return;
-            }
-            resolve({ host, port });
-          } catch (_) {
+    try {
+      const ret = $configuration.sendMessage({
+        action: "get_server_description",
+        content: tag,
+      });
+      // 兼容 Promise / 同步返回
+      if (ret && typeof ret.then === "function") {
+        ret.then(
+          function (msg) {
+            resolve(parseHostPort(msg, tag));
+          },
+          function () {
             resolve(null);
           }
-        },
-        () => resolve(null)
-      );
+        );
+      } else {
+        resolve(parseHostPort(ret, tag));
+      }
+    } catch (e) {
+      log("getServerHostPort: " + err(e));
+      resolve(null);
+    }
   });
 }
 
-/** check-host.net 远端 TCP */
+function parseHostPort(msg, tag) {
+  try {
+    if (!msg) return null;
+    const desc =
+      msg.ret && msg.ret[tag]
+        ? String(msg.ret[tag])
+        : typeof msg === "string"
+          ? msg
+          : "";
+    if (!desc) return null;
+    const eq = desc.indexOf("=");
+    if (eq < 0) return null;
+    const after = desc.substring(eq + 1);
+    const comma = after.indexOf(",");
+    const hp = comma < 0 ? after : after.substring(0, comma);
+    const colon = hp.lastIndexOf(":");
+    if (colon < 0) return null;
+    const host = hp.substring(0, colon).trim();
+    const port = hp.substring(colon + 1).trim();
+    if (!host || !/^\d+$/.test(port)) return null;
+    return { host: host, port: port };
+  } catch (e) {
+    return null;
+  }
+}
+
 async function checkHostRemote(host, port) {
-  const target = `${host}:${port}`;
+  const target = host + ":" + port;
   const submit = await fetchJson(
-    `${CHECK_HOST}/check-tcp?host=${encodeURIComponent(target)}&max_nodes=10`,
-    {
-      direct: true,
-      forceNoPolicy: true,
-      timeout: TIMEOUT,
-      headers: { Accept: "application/json", "User-Agent": UA },
-    }
+    CHECK_HOST +
+      "/check-tcp?host=" +
+      encodeURIComponent(target) +
+      "&max_nodes=6",
+    { mode: "direct" }
   );
   if (!submit || !submit.ok || !submit.request_id) {
     return { ok: false, error: "提交失败", items: [] };
   }
-  const rid = submit.request_id;
+  await sleep(3000);
+  const res = await fetchJson(CHECK_HOST + "/check-result/" + submit.request_id, {
+    mode: "direct",
+  });
   const nodeList = submit.nodes || {};
-  const nodeNames = Object.keys(nodeList);
-  const countryMap = {};
-  nodeNames.forEach((n) => {
-    const info = nodeList[n];
-    if (info && info.length >= 1) countryMap[n] = info[0];
-  });
-
-  await sleep(3500);
-
-  const res = await fetchJson(`${CHECK_HOST}/check-result/${rid}`, {
-    direct: true,
-    forceNoPolicy: true,
-    timeout: TIMEOUT,
-    headers: { Accept: "application/json", "User-Agent": UA },
-  });
-
+  const names = Object.keys(nodeList);
   let reachable = false;
   const items = [];
-  nodeNames.forEach((n) => {
-    const cc = countryMap[n] || "";
+  names.forEach(function (n) {
+    const info = nodeList[n];
+    const cc = info && info.length ? info[0] : "";
     const flag = cc ? flagsEmoji(cc) || "🌍" : "🌍";
     const nr = res && res[n];
-    let ms = "--.--ms";
-    if (nr && Array.isArray(nr) && nr.length > 0 && nr[0].time !== undefined) {
+    let ms = "--ms";
+    if (nr && nr.length && nr[0] && nr[0].time !== undefined) {
       reachable = true;
       ms = formatMs(nr[0].time * 1000);
     }
-    items.push({ flag, ms, ok: ms !== "--.--ms" });
+    items.push({ flag: flag, ms: ms });
   });
-  return { ok: reachable, items, error: reachable ? "" : "远端不可达" };
+  return {
+    ok: reachable,
+    items: items,
+    error: reachable ? "" : "远端不可达",
+  };
 }
 
-/** Globalping 国内运营商探测（仅阻断嫌疑时） */
 async function runGlobalping(host, port) {
-  const body = {
-    type: "ping",
-    target: host,
-    measurementOptions: { port: parseInt(port, 10), protocol: "TCP" },
-    locations: [{ country: "CN", tags: ["eyeball-network"] }],
-    limit: 12,
-  };
   const created = await fetchJson(GP_API, {
     method: "POST",
-    direct: true,
-    forceNoPolicy: true,
-    timeout: TIMEOUT,
+    mode: "direct",
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json",
       "User-Agent": UA,
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      type: "ping",
+      target: host,
+      measurementOptions: { port: parseInt(port, 10), protocol: "TCP" },
+      locations: [{ country: "CN", tags: ["eyeball-network"] }],
+      limit: 8,
+    }),
   });
   if (!created || !created.id) return null;
-  await sleep(6000);
-  return fetchJson(`${GP_API}/${created.id}`, {
-    direct: true,
-    forceNoPolicy: true,
-    timeout: TIMEOUT,
+  await sleep(5000);
+  return fetchJson(GP_API + "/" + created.id, {
+    mode: "direct",
     headers: { Accept: "application/json", "User-Agent": UA },
   });
 }
 
-// ── 组装展示数据 ─────────────────────────────────────────
+// ── 数据组装 ─────────────────────────────────────────────
 
 function buildBasic(ip, ipApi, ipapiIs, ipure) {
   const okApi = ipApi && ipApi.status === "success" ? ipApi : null;
@@ -392,36 +427,29 @@ function buildBasic(ip, ipApi, ipapiIs, ipure) {
     clean(ipure && ipure.city) || clean(okApi && okApi.city) || clean(loc.city),
   ]);
 
-  const asRaw =
-    (ipure && ipure.asn ? String(ipure.asn) : "") ||
-    clean(okApi && okApi.as) ||
-    clean(asnObj.asn);
-  const asn = asRaw
-    ? String(asRaw).indexOf("AS") === 0
-      ? String(asRaw)
-      : `AS${asRaw}`
-    : "";
+  let asRaw =
+    ipure && ipure.asn != null && ipure.asn !== ""
+      ? String(ipure.asn)
+      : clean(okApi && okApi.as) || clean(asnObj.asn);
+  asRaw = String(asRaw || "").replace(/^AS/i, "");
+  const asn = asRaw ? "AS" + asRaw : "";
   const org =
     clean(ipure && ipure.asOrganization) ||
     clean(okApi && (okApi.asname || okApi.org || okApi.isp)) ||
     clean(asnObj.org) ||
     clean(ipapiIs && ipapiIs.company && ipapiIs.company.name);
 
-  const nature = classifyNature(okApi, ipapiIs, ipure);
-
   return {
-    ip,
-    nature,
+    ip: ip,
+    nature: classifyNature(okApi, ipapiIs, ipure),
     region: code
-      ? `${flagEmoji} [${code}] ${country || ""}`.trim()
-      : flagEmoji
-        ? `${flagEmoji} ${country || ""}`.trim()
-        : country,
-    flagEmoji,
+      ? (flagEmoji + " [" + code + "] " + (country || "")).trim()
+      : (flagEmoji + " " + (country || "")).trim(),
+    flagEmoji: flagEmoji,
     flagImg: flagImageUrl(taiwan ? "CN" : code),
     city: cityParts.join(" · "),
-    asn,
-    org,
+    asn: asn,
+    org: org,
     timezone:
       clean(ipure && ipure.timezone) ||
       clean(okApi && okApi.timezone) ||
@@ -430,7 +458,6 @@ function buildBasic(ip, ipApi, ipapiIs, ipure) {
 }
 
 function classifyNature(okApi, ipapiIs, ipure) {
-  // IPPure 优先
   if (ipure && typeof ipure.isResidential === "boolean") {
     if (ipure.isResidential) {
       return ipure.isBroadcast
@@ -439,33 +466,16 @@ function classifyNature(okApi, ipapiIs, ipure) {
     }
     return "机房 IP · 数据中心，IPPure";
   }
-
   const hosting =
     !!(okApi && okApi.hosting) ||
     !!(ipapiIs && (ipapiIs.is_datacenter || ipapiIs.is_hosting));
-  const mobile =
-    !!(okApi && okApi.mobile) || !!(ipapiIs && ipapiIs.is_mobile);
+  const mobile = !!(okApi && okApi.mobile) || !!(ipapiIs && ipapiIs.is_mobile);
   const proxyLike =
     !!(okApi && okApi.proxy) ||
     !!(ipapiIs && (ipapiIs.is_proxy || ipapiIs.is_vpn || ipapiIs.is_tor));
-  const typeBits = [
-    ipapiIs && ipapiIs.company && ipapiIs.company.type,
-    ipapiIs && ipapiIs.asn && ipapiIs.asn.type,
-  ]
-    .map((x) => clean(x).toLowerCase())
-    .filter(Boolean)
-    .join(" ");
-
-  if (hosting || /\b(hosting|data\s*center|datacenter|cdn)\b/.test(typeBits)) {
-    return "机房 IP · 服务器/数据中心，一般不是家用宽带";
-  }
-  if (mobile || /\bmobile\b/.test(typeBits)) {
-    return "移动 IP · 手机/蜂窝流量网络";
-  }
+  if (hosting) return "机房 IP · 服务器/数据中心，一般不是家用宽带";
+  if (mobile) return "移动 IP · 手机/蜂窝流量网络";
   if (proxyLike) return "代理特征 · 库标记像代理/VPN（仅供参考）";
-  if (/\b(isp|residential|education|government)\b/.test(typeBits)) {
-    return "家宽倾向 · 更像宽带运营商线路（非机房）";
-  }
   if (okApi || ipapiIs) {
     return "家宽倾向 · 未检出机房/移动标记（不等于已认证住宅）";
   }
@@ -492,18 +502,19 @@ function buildPure(ipure) {
       levelKey = "critical";
     }
   }
-  const type = ipure.isResidential
-    ? ipure.isBroadcast
-      ? "住宅 · 广播"
-      : "住宅 · 原生倾向"
-    : typeof ipure.isResidential === "boolean"
-      ? "数据中心"
-      : "未知";
+  let type = "未知";
+  if (typeof ipure.isResidential === "boolean") {
+    type = ipure.isResidential
+      ? ipure.isBroadcast
+        ? "住宅 · 广播"
+        : "住宅 · 原生倾向"
+      : "数据中心";
+  }
   return {
-    score: score === null ? null : score,
-    level,
-    levelKey,
-    type,
+    score: score,
+    level: level,
+    levelKey: levelKey,
+    type: type,
     isResidential: ipure.isResidential,
     isBroadcast: ipure.isBroadcast,
   };
@@ -516,11 +527,14 @@ function buildRisks(ipApi, ipapiIs, ipure) {
     out.push(
       riskItem(
         s > 75 ? "bad" : s > 50 ? "warn" : "ok",
-        `IPPure　欺诈值 ${s} · ${s <= 25 ? "低" : s <= 50 ? "中" : s <= 75 ? "高" : "极高"}风险`
+        "IPPure　欺诈值 " +
+          s +
+          " · " +
+          (s <= 25 ? "低" : s <= 50 ? "中" : s <= 75 ? "高" : "极高") +
+          "风险"
       )
     );
   }
-
   const okApi = ipApi && ipApi.status === "success" ? ipApi : null;
   if (okApi) {
     const flags = [];
@@ -529,11 +543,10 @@ function buildRisks(ipApi, ipapiIs, ipure) {
     if (okApi.mobile) flags.push("移动");
     out.push(
       flags.length
-        ? riskItem("warn", `ip-api　命中 ${flags.join("、")}`)
+        ? riskItem("warn", "ip-api　命中 " + flags.join("、"))
         : riskItem("ok", "ip-api　未命中 proxy/hosting")
     );
   }
-
   if (ipapiIs && typeof ipapiIs === "object") {
     const flags = [];
     if (ipapiIs.is_proxy) flags.push("代理");
@@ -541,115 +554,86 @@ function buildRisks(ipApi, ipapiIs, ipure) {
     if (ipapiIs.is_tor) flags.push("Tor");
     if (ipapiIs.is_datacenter) flags.push("机房");
     if (ipapiIs.is_abuser) flags.push("滥用");
-    if (ipapiIs.is_crawler) flags.push("爬虫");
-    const score = ipapiIs.company && ipapiIs.company.abuser_score;
-    const scoreText = clean(score) ? `评分 ${score}` : "";
-    const bad = flags.length > 0;
-    if (flags.length || scoreText) {
-      out.push(
-        riskItem(
-          bad ? "warn" : "ok",
-          `ipapi.is　${[
-            flags.length ? `命中 ${flags.join("、")}` : "无风险标记",
-            scoreText,
-          ]
-            .filter(Boolean)
-            .join(" · ")}`
-        )
-      );
-    } else {
-      out.push(riskItem("ok", "ipapi.is　无风险标记"));
-    }
+    out.push(
+      flags.length
+        ? riskItem("warn", "ipapi.is　命中 " + flags.join("、"))
+        : riskItem("ok", "ipapi.is　无风险标记")
+    );
   }
   return out;
 }
 
 function buildBlockReport(ctx) {
-  const { nodeOk, directOk, remote, gp, nodeIp, nodeLoc, nodeIsp } = ctx;
+  const nodeOk = !!ctx.nodeOk;
+  const directOk = ctx.directOk;
+  const remote = ctx.remote;
   const rOk = remote && remote.ok;
-  const items = (remote && remote.items) || [];
-
   let conclusion = "❓ 数据不完整";
-  let conclusionKey = "unknown";
   let gpAnalysis = null;
 
   if (directOk === false) {
     conclusion = "⚠️ 本机网络异常";
-    conclusionKey = "local";
-  } else if (nodeOk && rOk) {
-    conclusion = "✅ 节点正常";
-    conclusionKey = "ok";
-  } else if (nodeOk && remote === null) {
-    conclusion = "✅ 节点代理可达（未做远端 TCP）";
-    conclusionKey = "ok";
-  } else if (nodeOk && !rOk) {
-    conclusion = "⚠️ 节点可代理，但服务端口远端探测失败（或无地址信息）";
-    conclusionKey = "warn";
+  } else if (nodeOk && (rOk || remote == null)) {
+    conclusion = rOk === false
+      ? "⚠️ 节点可代理，但服务端口远端探测失败"
+      : "✅ 节点正常";
   } else if (!nodeOk && rOk && directOk) {
-    if (gp && gp.results) {
-      gpAnalysis = analyzeBlockSource(gp);
+    if (ctx.gp && ctx.gp.results) {
+      gpAnalysis = analyzeBlockSource(ctx.gp);
       conclusion = gpAnalysis.conclusion;
-      conclusionKey = "block";
     } else {
       conclusion = "🚫 疑似被运营商/GFW 阻断";
-      conclusionKey = "block";
     }
   } else if (!nodeOk && !rOk && directOk) {
     conclusion = "💤 节点离线";
-    conclusionKey = "offline";
   }
 
   return {
-    nodeOk,
-    directOk,
-    remoteOk: remote === null ? null : !!rOk,
-    remoteError: remote && remote.error ? remote.error : "",
-    remoteItems: items,
-    nodeIp,
-    nodeLoc,
-    nodeIsp,
-    conclusion,
-    conclusionKey,
-    gpAnalysis,
+    nodeOk: nodeOk,
+    directOk: directOk,
+    remoteOk: remote == null ? null : !!rOk,
+    remoteError: (remote && remote.error) || "",
+    remoteItems: (remote && remote.items) || [],
+    nodeIp: ctx.nodeIp || "",
+    nodeLoc: ctx.nodeLoc || "",
+    conclusion: conclusion,
+    gpAnalysis: gpAnalysis,
   };
 }
 
 function analyzeBlockSource(gpData) {
-  const results = gpData.results;
-  if (!results) return null;
+  const results = gpData.results || [];
   const ispGroups = {};
-  results.forEach((r) => {
+  results.forEach(function (r) {
     const isp = classifyISP(r.probe && r.probe.network);
     if (!isp) return;
     if (!ispGroups[isp]) ispGroups[isp] = { probes: [], reachable: false };
     const res = r.result || {};
     const stats = res.stats;
     let ok = false;
-    let ms = "--.--ms";
+    let ms = "--ms";
     if (res.status === "finished" && stats) {
       ok = stats.rcv > 0;
-      ms = ok ? formatMs(stats.avg || 0) : "--.--ms";
+      ms = ok ? formatMs(stats.avg || 0) : "--ms";
     }
     if (ok) ispGroups[isp].reachable = true;
     ispGroups[isp].probes.push({
       city: cnCity(r.probe.city),
-      ok,
-      ms,
+      ok: ok,
+      ms: ms,
     });
   });
-
   const reachableIsps = [];
   const blockedIsps = [];
-  Object.keys(ispGroups).forEach((k) => {
+  Object.keys(ispGroups).forEach(function (k) {
     if (!ispGroups[k].probes.length) return;
     if (ispGroups[k].reachable) reachableIsps.push(k);
     else blockedIsps.push(k);
   });
-
   let conclusion;
-  if (reachableIsps.length === 0) {
+  if (!reachableIsps.length) {
     conclusion = "🚫 GFW 全局阻断 — 国内三大运营商均无法访问";
-  } else if (blockedIsps.length > 0) {
+  } else if (blockedIsps.length) {
     conclusion =
       "🚫 运营商级拦截 — " +
       blockedIsps.join("、") +
@@ -657,27 +641,16 @@ function analyzeBlockSource(gpData) {
       reachableIsps.join("、") +
       " 正常";
   } else {
-    conclusion =
-      "✅ 国内三大运营商全部可达，非 GFW/运营商拦截，请检查客户端配置";
+    conclusion = "✅ 国内三大运营商全部可达，请检查客户端配置";
   }
-  return { ispGroups, conclusion };
+  return { ispGroups: ispGroups, conclusion: conclusion };
 }
 
 function classifyISP(network) {
   const n = String(network || "").toLowerCase();
-  if (n.indexOf("unicom") >= 0 || n.indexOf("china unicom") >= 0) {
-    return "中国联通";
-  }
-  if (
-    n.indexOf("chinanet") >= 0 ||
-    n.indexOf("telecom") >= 0 ||
-    n.indexOf("china telecom") >= 0
-  ) {
-    return "中国电信";
-  }
-  if (n.indexOf("mobile") >= 0 || n.indexOf("china mobile") >= 0) {
-    return "中国移动";
-  }
+  if (n.indexOf("unicom") >= 0) return "中国联通";
+  if (n.indexOf("chinanet") >= 0 || n.indexOf("telecom") >= 0) return "中国电信";
+  if (n.indexOf("mobile") >= 0) return "中国移动";
   return null;
 }
 
@@ -691,24 +664,6 @@ function cnCity(en) {
     Hangzhou: "杭州",
     Wuhan: "武汉",
     Nanjing: "南京",
-    Tianjin: "天津",
-    "Xi'an": "西安",
-    Changsha: "长沙",
-    Zhengzhou: "郑州",
-    Jinan: "济南",
-    Qingdao: "青岛",
-    Dalian: "大连",
-    Xiamen: "厦门",
-    Fuzhou: "福州",
-    Kunming: "昆明",
-    Hefei: "合肥",
-    Ningbo: "宁波",
-    Suzhou: "苏州",
-    Harbin: "哈市",
-    Changchun: "长春",
-    Shenyang: "沈阳",
-    Foshan: "佛山",
-    Dongguan: "东莞",
   };
   return map[en] || en || "";
 }
@@ -716,138 +671,112 @@ function cnCity(en) {
 // ── 渲染 ─────────────────────────────────────────────────
 
 function renderAll(basic, risks, pure, block, theme) {
-  lines.push(`🌐 IP　${displayIP(basic.ip)}`);
-  if (basic.nature) lines.push(`${theme.natureEmoji} 类型　${basic.nature}`);
-  if (basic.region) lines.push(`📍 地区　${basic.region}`);
-  if (basic.city) lines.push(`🏙️ 城市　${basic.city}`);
-  if (basic.asn) lines.push(`🔢 ASN　${basic.asn}`);
-  if (basic.org) lines.push(`🏢 组织　${basic.org}`);
-  if (basic.timezone) lines.push(`🕐 时区　${basic.timezone}`);
-  if (FROM_UI && POLICY) lines.push(`📡 节点　${POLICY}`);
-  else if (POLICY) lines.push(`📡 策略　${POLICY}`);
+  lines.push("🌐 IP　" + displayIP(basic.ip));
+  if (basic.nature) lines.push(theme.natureEmoji + " 类型　" + basic.nature);
+  if (basic.region) lines.push("📍 地区　" + basic.region);
+  if (basic.city) lines.push("🏙️ 城市　" + basic.city);
+  if (basic.asn) lines.push("🔢 ASN　" + basic.asn);
+  if (basic.org) lines.push("🏢 组织　" + basic.org);
+  if (basic.timezone) lines.push("🕐 时区　" + basic.timezone);
+  if (POLICY) lines.push("📡 节点　" + POLICY);
 
   if (pure) {
     lines.push("");
     lines.push("✨ IPPure 纯净度");
-    lines.push(`　类型　${pure.type}`);
+    lines.push("　类型　" + pure.type);
     if (pure.score !== null) {
-      lines.push(`　欺诈值　${pure.score} · ${pure.level}`);
+      lines.push("　欺诈值　" + pure.score + " · " + pure.level);
     }
   }
 
   if (risks.length) {
     lines.push("");
     lines.push("🛡️ 风险");
-    risks.forEach((r) => lines.push(`　${r.icon} ${r.text}`));
+    risks.forEach(function (r) {
+      lines.push("　" + r.icon + " " + r.text);
+    });
   }
 
   if (block) {
     lines.push("");
     lines.push("🔗 连通 / 阻断");
-    lines.push(
-      `　节点代理　${block.nodeOk ? "✅ 正常" : "❌ 不可达"}`
-    );
+    lines.push("　节点代理　" + (block.nodeOk ? "✅ 正常" : "❌ 不可达"));
     if (block.directOk !== null) {
-      lines.push(
-        `　本机网络　${block.directOk ? "✅ 正常" : "❌ 异常"}`
-      );
+      lines.push("　本机网络　" + (block.directOk ? "✅ 正常" : "❌ 异常"));
     }
     if (block.remoteOk !== null) {
-      lines.push(
-        `　远端探测　${block.remoteOk ? "✅ 可达" : "❌ 不可达"}`
-      );
-      if (block.remoteItems && block.remoteItems.length) {
-        const pair = block.remoteItems
-          .slice(0, 6)
-          .map((it) => `${it.flag} ${it.ms}`)
-          .join("  ");
-        lines.push(`　${pair}`);
+      lines.push("　远端探测　" + (block.remoteOk ? "✅ 可达" : "❌ 不可达"));
+      if (block.remoteItems.length) {
+        lines.push(
+          "　" +
+            block.remoteItems
+              .slice(0, 6)
+              .map(function (it) {
+                return it.flag + " " + it.ms;
+              })
+              .join("  ")
+        );
       } else if (block.remoteError) {
-        lines.push(`　${block.remoteError}`);
+        lines.push("　" + block.remoteError);
       }
     }
-    lines.push(`　结论　${block.conclusion}`);
+    lines.push("　结论　" + block.conclusion);
   }
 
   if (warn.length) {
     lines.push("");
     lines.push("💡 提示");
-    warn.slice(0, 5).forEach((w) => lines.push(`　⚠️ ${w}`));
+    warn.slice(0, 5).forEach(function (w) {
+      lines.push("　⚠️ " + w);
+    });
   }
 
-  const title = `${theme.titleEmoji} 节点 IP 质量检测`;
-  const subtitle = FROM_UI
-    ? POLICY
-    : POLICY
-      ? `策略 · ${POLICY}`
-      : "默认路由";
+  const title = theme.titleEmoji + " 节点 IP 质量检测";
+  const subtitle = POLICY || "默认路由";
   const body = lines.join("\n");
   const html = buildResultHtml(basic, risks, pure, block, warn, theme);
-
-  $notify(title, subtitle, body);
-  $done({
-    title,
-    htmlMessage: html,
-    icon: theme.sfSymbol,
-    "icon-color": theme.color,
-  });
+  doneOK(title, subtitle, body, html, theme);
 }
 
-function finishWithBlockOnly(block) {
+function renderFailureWithBlock(block) {
   lines.push("🔗 连通 / 阻断");
-  lines.push(`　节点代理　❌ 不可达`);
+  lines.push("　节点代理　❌ 不可达");
   if (block.directOk !== null) {
-    lines.push(
-      `　本机网络　${block.directOk ? "✅ 正常" : "❌ 异常"}`
-    );
+    lines.push("　本机网络　" + (block.directOk ? "✅ 正常" : "❌ 异常"));
   }
   if (block.remoteOk !== null) {
-    lines.push(
-      `　远端探测　${block.remoteOk ? "✅ 可达" : "❌ 不可达"}`
-    );
-    if (block.remoteItems && block.remoteItems.length) {
-      lines.push(
-        `　${block.remoteItems
-          .slice(0, 6)
-          .map((it) => `${it.flag} ${it.ms}`)
-          .join("  ")}`
-      );
-    }
+    lines.push("　远端探测　" + (block.remoteOk ? "✅ 可达" : "❌ 不可达"));
   }
-  lines.push(`　结论　${block.conclusion}`);
-  if (POLICY) lines.push(`📡 节点　${POLICY}`);
+  lines.push("　结论　" + block.conclusion);
+  if (POLICY) lines.push("📡 节点　" + POLICY);
 
   const title = "🌐 节点 IP 质量检测";
   const body = lines.join("\n");
   const html =
-    `<div style="font-family:-apple-system;font-size:14px;line-height:1.45;text-align:left">` +
+    '<div style="font-family:-apple-system;font-size:14px;line-height:1.45;text-align:left">' +
     htmlSection("🔗 连通 / 阻断") +
     htmlBlockSection(block) +
     (POLICY ? htmlRow("📡", "节点", POLICY) : "") +
-    `</div>`;
-
-  $notify(title, POLICY || "失败", body);
-  $done({
-    title,
-    htmlMessage: html,
-    icon: "exclamationmark.triangle.fill",
-    "icon-color": "#FF453A",
+    "</div>";
+  doneOK(title, POLICY || "失败", body, html, {
+    sfSymbol: "exclamationmark.triangle.fill",
+    color: "#FF453A",
   });
 }
 
 function riskItem(level, text) {
   return {
-    level,
-    text,
-    icon: level === "warn" ? "🟠" : level === "bad" ? "🔴" : "🟢",
+    level: level,
+    text: text,
+    icon: level === "bad" ? "🔴" : level === "warn" ? "🟠" : "🟢",
   };
 }
 
 function resultTheme(basic, risks, pure) {
   const nature = (basic && basic.nature) || "";
-  const hasWarn = (risks || []).some(
-    (r) => r.level === "warn" || r.level === "bad"
-  );
+  const hasWarn = (risks || []).some(function (r) {
+    return r.level === "warn" || r.level === "bad";
+  });
   if (pure && pure.levelKey === "critical") {
     return {
       titleEmoji: "‼️",
@@ -884,24 +813,6 @@ function resultTheme(basic, risks, pure) {
       badge: "机房",
     };
   }
-  if (nature.indexOf("移动") >= 0) {
-    return {
-      titleEmoji: "📱",
-      natureEmoji: "📱",
-      sfSymbol: "antenna.radiowaves.left.and.right",
-      color: "#0A84FF",
-      badge: "移动",
-    };
-  }
-  if (hasWarn || nature.indexOf("代理") >= 0) {
-    return {
-      titleEmoji: "🛡️",
-      natureEmoji: "🕵️",
-      sfSymbol: "network.badge.shield.half.filled",
-      color: "#FF9F0A",
-      badge: "关注",
-    };
-  }
   if (nature.indexOf("家宽") >= 0 || nature.indexOf("住宅") >= 0) {
     return {
       titleEmoji: "🏠",
@@ -909,6 +820,15 @@ function resultTheme(basic, risks, pure) {
       sfSymbol: "house.fill",
       color: "#30D158",
       badge: "家宽倾向",
+    };
+  }
+  if (hasWarn) {
+    return {
+      titleEmoji: "🛡️",
+      natureEmoji: "🕵️",
+      sfSymbol: "network.badge.shield.half.filled",
+      color: "#FF9F0A",
+      badge: "关注",
     };
   }
   return {
@@ -943,13 +863,17 @@ function buildResultHtml(basic, risks, pure, block, warnings, theme) {
             : pure.levelKey === "high"
               ? "#FF9F0A"
               : "#FF453A";
-      rows.push(htmlRow("📊", "欺诈值", `${pure.score} 分 · ${pure.level}`, c));
+      rows.push(
+        htmlRow("📊", "欺诈值", pure.score + " 分 · " + pure.level, c)
+      );
     }
   }
 
   rows.push(htmlSection("🛡️ 风险"));
   if (risks && risks.length) {
-    risks.forEach((r) => rows.push(htmlRiskLine(r)));
+    risks.forEach(function (r) {
+      rows.push(htmlRiskLine(r));
+    });
   } else {
     rows.push(htmlMuted("⚪ 本次无可用标记"));
   }
@@ -961,13 +885,15 @@ function buildResultHtml(basic, risks, pure, block, warnings, theme) {
 
   if (warnings && warnings.length) {
     rows.push(htmlSection("💡 提示"));
-    warnings.slice(0, 5).forEach((w) => rows.push(htmlMuted(`⚠️ ${w}`)));
+    warnings.slice(0, 5).forEach(function (w) {
+      rows.push(htmlMuted("⚠️ " + w));
+    });
   }
 
   return (
-    `<div style="font-family:-apple-system,BlinkMacSystemFont,Helvetica;font-size:14px;line-height:1.45;text-align:left;color:#1c1c1e">` +
+    '<div style="font-family:-apple-system,BlinkMacSystemFont,Helvetica;font-size:14px;line-height:1.45;text-align:left;color:#1c1c1e">' +
     rows.join("") +
-    `</div>`
+    "</div>"
   );
 }
 
@@ -981,7 +907,13 @@ function htmlBlockSection(block) {
     )
   );
   if (block.nodeOk && block.nodeIp) {
-    parts.push(htmlMuted(`IP ${block.nodeIp}${block.nodeLoc ? " · " + block.nodeLoc : ""}`));
+    parts.push(
+      htmlMuted(
+        "IP " +
+          block.nodeIp +
+          (block.nodeLoc ? " · " + block.nodeLoc : "")
+      )
+    );
   }
   if (block.directOk !== null) {
     parts.push(
@@ -1002,74 +934,82 @@ function htmlBlockSection(block) {
     );
     if (block.remoteItems && block.remoteItems.length) {
       let grid = "";
-      for (let i = 0; i < block.remoteItems.length; i += 2) {
+      for (let i = 0; i < Math.min(block.remoteItems.length, 8); i += 2) {
         const a = block.remoteItems[i];
         const b = block.remoteItems[i + 1];
-        grid += `<div style="font-size:12px;font-family:Menlo,monospace;margin:2px 0">${escapeHtml(a.flag + " " + a.ms)}`;
-        if (b) grid += `&emsp;${escapeHtml(b.flag + " " + b.ms)}`;
-        grid += `</div>`;
+        grid +=
+          '<div style="font-size:12px;font-family:Menlo,monospace;margin:2px 0">' +
+          escapeHtml(a.flag + " " + a.ms);
+        if (b) grid += "&emsp;" + escapeHtml(b.flag + " " + b.ms);
+        grid += "</div>";
       }
       parts.push(grid);
     } else if (block.remoteError) {
       parts.push(htmlMuted(block.remoteError));
     }
   }
-
-  if (block.gpAnalysis && block.gpAnalysis.ispGroups) {
-    parts.push(htmlMuted("国内探测"));
-    const order = ["中国电信", "中国联通", "中国移动"];
-    const abbr = { 中国电信: "电信", 中国联通: "联通", 中国移动: "移动" };
-    order.forEach((k) => {
-      const g = block.gpAnalysis.ispGroups[k];
-      if (!g) return;
-      g.probes.forEach((p) => {
-        const c = p.ok ? "#30D158" : "#FF453A";
-        parts.push(
-          `<div style="font-size:12px;margin:2px 0">${escapeHtml(abbr[k] + "·" + p.city)} <span style="color:${c};font-family:Menlo,monospace">${escapeHtml(p.ms)}</span></div>`
-        );
-      });
-    });
-  }
-
   parts.push(
-    `<div style="margin-top:10px;padding:10px 12px;border-radius:10px;background:#f2f2f7;font-weight:700;line-height:1.4">${escapeHtml(block.conclusion)}</div>`
+    '<div style="margin-top:10px;padding:10px 12px;border-radius:10px;background:#f2f2f7;font-weight:700;line-height:1.4">' +
+      escapeHtml(block.conclusion) +
+      "</div>"
   );
   return parts.join("");
 }
 
 function htmlHero(ip, theme) {
   return (
-    `<div style="margin:0 0 14px 0;padding:12px 14px;border-radius:12px;background:linear-gradient(135deg,${theme.color}22,${theme.color}08);border:1px solid ${theme.color}33">` +
-    `<div style="font-size:11px;color:${theme.color};font-weight:700;letter-spacing:0.4px">${escapeHtml(theme.titleEmoji + " " + theme.badge)}</div>` +
-    `<div style="margin-top:4px;font-size:22px;font-weight:800;letter-spacing:0.3px;line-height:1.2">${escapeHtml(ip)}</div>` +
-    `</div>`
+    '<div style="margin:0 0 14px 0;padding:12px 14px;border-radius:12px;background:linear-gradient(135deg,' +
+    theme.color +
+    "22," +
+    theme.color +
+    "08);border:1px solid " +
+    theme.color +
+    '33">' +
+    '<div style="font-size:11px;color:' +
+    theme.color +
+    ';font-weight:700">' +
+    escapeHtml((theme.titleEmoji || "🌐") + " " + (theme.badge || "")) +
+    "</div>" +
+    '<div style="margin-top:4px;font-size:22px;font-weight:800;line-height:1.2">' +
+    escapeHtml(ip) +
+    "</div></div>"
   );
 }
 
 function htmlRow(emoji, label, value, accent) {
   const valueColor = accent || "#1c1c1e";
   return (
-    `<div style="margin:0 0 10px 0">` +
-    `<div style="font-size:11px;color:#8e8e93">${escapeHtml(emoji + " " + label)}</div>` +
-    `<div style="margin-top:2px;font-size:14px;font-weight:600;color:${valueColor};word-break:break-word">${escapeHtml(value)}</div>` +
-    `</div>`
+    '<div style="margin:0 0 10px 0">' +
+    '<div style="font-size:11px;color:#8e8e93">' +
+    escapeHtml(emoji + " " + label) +
+    "</div>" +
+    '<div style="margin-top:2px;font-size:14px;font-weight:600;color:' +
+    valueColor +
+    ';word-break:break-word">' +
+    escapeHtml(value) +
+    "</div></div>"
   );
 }
 
 function htmlKV(label, value, color) {
   return (
-    `<div style="margin:0 0 8px 0;font-size:13px">` +
-    `<span style="color:#8e8e93;font-weight:600">${escapeHtml(label)}</span>　` +
-    `<span style="font-weight:700;color:${color || "#1c1c1e"}">${escapeHtml(value)}</span>` +
-    `</div>`
+    '<div style="margin:0 0 8px 0;font-size:13px">' +
+    '<span style="color:#8e8e93;font-weight:600">' +
+    escapeHtml(label) +
+    "</span>　" +
+    '<span style="font-weight:700;color:' +
+    (color || "#1c1c1e") +
+    '">' +
+    escapeHtml(value) +
+    "</span></div>"
   );
 }
 
 function htmlSection(title) {
   return (
-    `<div style="margin:14px 0 8px 0;padding-top:10px;border-top:1px solid #e5e5ea;font-size:12px;font-weight:700;color:#8e8e93">` +
+    '<div style="margin:14px 0 8px 0;padding-top:10px;border-top:1px solid #e5e5ea;font-size:12px;font-weight:700;color:#8e8e93">' +
     escapeHtml(title) +
-    `</div>`
+    "</div>"
   );
 }
 
@@ -1081,120 +1021,194 @@ function htmlRiskLine(risk) {
         ? "#FF9F0A"
         : "#30D158";
   return (
-    `<div style="margin:0 0 8px 0;font-size:13px;line-height:1.4">` +
-    `<span style="color:${color}">${escapeHtml(risk.icon)}</span> ` +
-    `<span style="font-weight:600">${escapeHtml(risk.text)}</span>` +
-    `</div>`
+    '<div style="margin:0 0 8px 0;font-size:13px;line-height:1.4">' +
+    '<span style="color:' +
+    color +
+    '">' +
+    escapeHtml(risk.icon) +
+    "</span> " +
+    '<span style="font-weight:600">' +
+    escapeHtml(risk.text) +
+    "</span></div>"
   );
 }
 
 function htmlMuted(text) {
   return (
-    `<div style="margin:0 0 8px 0;font-size:12px;color:#8e8e93;line-height:1.4">${escapeHtml(text)}</div>`
+    '<div style="margin:0 0 8px 0;font-size:12px;color:#8e8e93;line-height:1.4">' +
+    escapeHtml(text) +
+    "</div>"
   );
 }
 
 function htmlRegionRow(basic) {
   const img = basic.flagImg
-    ? `<img src="${escapeHtml(basic.flagImg)}" width="22" height="16" alt="" style="vertical-align:-2px;margin-right:6px;border-radius:2px;box-shadow:0 0 0 1px rgba(0,0,0,0.08)" />`
+    ? '<img src="' +
+      escapeHtml(basic.flagImg) +
+      '" width="22" height="16" alt="" style="vertical-align:-2px;margin-right:6px;border-radius:2px" />'
     : "";
   const emoji = basic.flagEmoji ? escapeHtml(basic.flagEmoji) + " " : "";
   const text = String(basic.region || "")
     .replace(/^(?:\uD83C[\uDDE6-\uDDFF]){2}\s*/g, "")
     .trim();
   return (
-    `<div style="margin:0 0 10px 0">` +
-    `<div style="font-size:11px;color:#8e8e93">📍 地区</div>` +
-    `<div style="margin-top:2px;font-size:14px;font-weight:600;line-height:1.35;word-break:break-word">` +
+    '<div style="margin:0 0 10px 0">' +
+    '<div style="font-size:11px;color:#8e8e93">📍 地区</div>' +
+    '<div style="margin-top:2px;font-size:14px;font-weight:600;line-height:1.35">' +
     img +
     emoji +
     escapeHtml(text) +
-    `</div></div>`
+    "</div></div>"
   );
 }
 
-// ── HTTP ─────────────────────────────────────────────────
+// ── HTTP（兼容 QX）──────────────────────────────────────
 
 function fetchJson(url, options) {
-  return fetchRaw(url, options).then((r) => {
+  return fetchRaw(url, options).then(function (r) {
     try {
       return JSON.parse(r.body || "");
-    } catch (_) {
+    } catch (e) {
       throw new Error("JSON 解析失败");
     }
   });
 }
 
 function fetchText(url, options) {
-  return fetchRaw(url, options).then((r) => String(r.body || ""));
+  return fetchRaw(url, options).then(function (r) {
+    return String(r.body || "");
+  });
 }
 
+/**
+ * mode:
+ *   "node"   → 绑 POLICY（长按节点）
+ *   "direct" → 尝试 direct；失败则不带 policy 重试
+ *   "auto"   → 不绑策略
+ */
 function fetchRaw(url, options) {
   const opt = options || {};
-  const req = {
-    url,
-    method: (opt.method || "GET").toUpperCase(),
-    headers: opt.headers || { "User-Agent": UA },
-    timeout: numberOrNull(opt.timeout) !== null ? Number(opt.timeout) : TIMEOUT,
-  };
-  if (typeof opt.body !== "undefined") req.body = opt.body;
+  const mode = opt.mode || "node";
 
-  // direct / forceNoPolicy → 官方 direct；否则绑长按节点 / argument 策略
-  if (opt.forceNoPolicy || opt.direct) {
-    req.opts = { policy: "direct" };
-  } else if (POLICY) {
-    req.opts = { policy: POLICY };
+  function once(usePolicy) {
+    return new Promise(function (resolve, reject) {
+      const req = {
+        url: url,
+        method: String(opt.method || "GET").toUpperCase(),
+        headers: opt.headers || { "User-Agent": UA },
+      };
+      if (opt.body != null) req.body = opt.body;
+      if (usePolicy) req.opts = { policy: usePolicy };
+
+      $task.fetch(req).then(
+        function (resp) {
+          const statusCode = Number(resp.statusCode);
+          if (
+            !opt.allowError &&
+            (!isFinite(statusCode) || statusCode < 200 || statusCode >= 300)
+          ) {
+            reject(new Error("HTTP " + (statusCode || "?")));
+            return;
+          }
+          resolve({
+            statusCode: statusCode,
+            body: String(resp.body || ""),
+            headers: resp.headers || {},
+          });
+        },
+        function (reason) {
+          reject(
+            new Error(String(reason && reason.error ? reason.error : reason))
+          );
+        }
+      );
+    });
   }
 
-  return $task.fetch(req).then(
-    (resp) => {
-      const statusCode = Number(resp.statusCode);
-      if (
-        !opt.allowError &&
-        (!Number.isFinite(statusCode) || statusCode < 200 || statusCode >= 300)
-      ) {
-        throw new Error(`HTTP ${statusCode || "?"}`);
-      }
-      return {
-        statusCode,
-        body: String(resp.body || ""),
-        headers: resp.headers || {},
-      };
-    },
-    (reason) => {
-      throw new Error(String(reason && reason.error ? reason.error : reason));
-    }
-  );
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  if (mode === "node") {
+    if (POLICY) return once(POLICY);
+    return once(null);
+  }
+  if (mode === "direct") {
+    // 部分版本 policy:direct 异常，失败则无 policy 重试
+    return once("direct").catch(function () {
+      return once(null);
+    });
+  }
+  return once(null);
 }
 
 // ── 工具 ─────────────────────────────────────────────────
+
+function safe(promise, fallback) {
+  return Promise.resolve(promise).catch(function (e) {
+    log("safe: " + err(e));
+    return fallback;
+  });
+}
+
+function withTimeout(promise, ms, fallback) {
+  return new Promise(function (resolve) {
+    let done = false;
+    const timer = setTimeout(function () {
+      if (!done) {
+        done = true;
+        resolve(fallback);
+      }
+    }, ms);
+    Promise.resolve(promise).then(
+      function (v) {
+        if (!done) {
+          done = true;
+          clearTimeout(timer);
+          resolve(v);
+        }
+      },
+      function () {
+        if (!done) {
+          done = true;
+          clearTimeout(timer);
+          resolve(fallback);
+        }
+      }
+    );
+  });
+}
+
+function sleep(ms) {
+  return new Promise(function (resolve) {
+    setTimeout(resolve, ms);
+  });
+}
 
 function parseArgument(raw) {
   const out = {};
   String(raw || "")
     .split("&")
-    .forEach((pair) => {
+    .forEach(function (pair) {
       if (!pair) return;
       const i = pair.indexOf("=");
       if (i < 0) {
-        out[decodeURIComponent(pair)] = "1";
+        try {
+          out[decodeURIComponent(pair)] = "1";
+        } catch (e) {
+          out[pair] = "1";
+        }
         return;
       }
-      const k = decodeURIComponent(pair.slice(0, i).trim());
-      const v = decodeURIComponent(pair.slice(i + 1).trim());
+      let k = pair.slice(0, i).trim();
+      let v = pair.slice(i + 1).trim();
+      try {
+        k = decodeURIComponent(k);
+        v = decodeURIComponent(v);
+      } catch (e) {}
       if (k) out[k] = v;
     });
   return out;
 }
 
 function isTruthy(value, defaultValue) {
-  if (value === null || typeof value === "undefined" || value === "") {
-    return defaultValue;
-  }
+  if (value == null || value === "") return defaultValue;
   const t = String(value).toLowerCase();
   if (["0", "false", "no", "off"].indexOf(t) >= 0) return false;
   if (["1", "true", "yes", "on"].indexOf(t) >= 0) return true;
@@ -1206,7 +1220,9 @@ function normalizeIP(value) {
   const parts = text.split(".");
   if (
     parts.length === 4 &&
-    parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) >= 0 && Number(p) <= 255)
+    parts.every(function (p) {
+      return /^\d{1,3}$/.test(p) && Number(p) >= 0 && Number(p) <= 255;
+    })
   ) {
     return text;
   }
@@ -1217,23 +1233,20 @@ function displayIP(ip) {
   if (!MASK_IP) return ip;
   const parts = String(ip).split(".");
   if (parts.length !== 4) return ip;
-  return `${parts[0]}.${parts[1]}.*.*`;
+  return parts[0] + "." + parts[1] + ".*.*";
 }
 
 function numberOrNull(value) {
-  if (value === null || typeof value === "undefined" || value === "") return null;
+  if (value == null || value === "") return null;
   const n = Number(value);
-  return Number.isFinite(n) ? n : null;
+  return isFinite(n) ? n : null;
 }
 
 function formatMs(ms) {
   const n = Number(ms);
-  if (!Number.isFinite(n) || n <= 0) return "0.00ms";
-  if (n >= 10000) return Math.floor(n) + "ms";
-  if (n >= 1000) return Math.floor(n) + "ms";
-  if (n >= 100) return n.toFixed(1) + "ms";
-  if (n >= 10) return n.toFixed(2) + "ms";
-  return n.toFixed(3) + "ms";
+  if (!isFinite(n) || n <= 0) return "0ms";
+  if (n >= 100) return Math.round(n) + "ms";
+  return n.toFixed(1) + "ms";
 }
 
 function isTaiwanRegion(code, country) {
@@ -1242,7 +1255,9 @@ function isTaiwanRegion(code, country) {
     .replace(/[^A-Z]/g, "");
   const n = String(country || "");
   if (c === "TW" || c === "TWN") return true;
-  return /taiwan|twn|台灣|台湾|臺湾|中华民国|中華民國|taipei|台北|臺北/i.test(n);
+  return /taiwan|twn|台灣|台湾|臺湾|中华民国|中華民國|taipei|台北|臺北/i.test(
+    n
+  );
 }
 
 function flagsEmoji(countryCode) {
@@ -1251,11 +1266,16 @@ function flagsEmoji(countryCode) {
     .replace(/[^A-Z]/g, "");
   if (code.length !== 2) return "";
   if (code === "TW" || code === "CN") return "🇨🇳";
-  const emoji = String.fromCodePoint(
-    ...code.split("").map((ch) => 0x1f1a5 + ch.charCodeAt(0))
-  );
-  if (emoji === "🇹🇼") return "🇨🇳";
-  return emoji;
+  try {
+    const emoji = String.fromCodePoint(
+      code.charCodeAt(0) + 0x1f1a5,
+      code.charCodeAt(1) + 0x1f1a5
+    );
+    if (emoji === "🇹🇼") return "🇨🇳";
+    return emoji;
+  } catch (e) {
+    return "";
+  }
 }
 
 function flagImageUrl(code) {
@@ -1263,13 +1283,12 @@ function flagImageUrl(code) {
     .toLowerCase()
     .replace(/[^a-z]/g, "");
   if (c.length !== 2) return "";
-  const iso = c === "tw" ? "cn" : c;
-  return `https://flagcdn.com/w40/${iso}.png`;
+  return "https://flagcdn.com/w40/" + (c === "tw" ? "cn" : c) + ".png";
 }
 
 function unique(arr) {
   const out = [];
-  arr.forEach((x) => {
+  (arr || []).forEach(function (x) {
     const v = clean(x);
     if (v && out.indexOf(v) < 0) out.push(v);
   });
@@ -1277,14 +1296,14 @@ function unique(arr) {
 }
 
 function clean(value) {
-  if (value === null || typeof value === "undefined") return "";
+  if (value == null) return "";
   const text = String(value).trim();
   if (!text || /^(null|undefined|n\/a|unknown|-)$/i.test(text)) return "";
   return text;
 }
 
 function escapeHtml(value) {
-  return String(value === null || typeof value === "undefined" ? "" : value)
+  return String(value == null ? "" : value)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
@@ -1297,20 +1316,46 @@ function err(e) {
 }
 
 function log(msg) {
-  console.log(`[ipquality-qx] ${msg}`);
+  console.log("[ipquality-qx] " + msg);
+}
+
+function doneOK(title, subtitle, body, html, theme) {
+  if (finished) return;
+  finished = true;
+  try {
+    $notify(title || "节点 IP 质量检测", subtitle || "", body || "");
+  } catch (e) {}
+  const payload = {
+    title: title || "节点 IP 质量检测",
+    htmlMessage:
+      html ||
+      '<div style="font-family:-apple-system;padding:12px">' +
+        escapeHtml(body || "完成") +
+        "</div>",
+  };
+  if (theme && theme.sfSymbol) payload.icon = theme.sfSymbol;
+  if (theme && theme.color) payload["icon-color"] = theme.color;
+  $done(payload);
 }
 
 function fail(message) {
+  if (finished) return;
+  finished = true;
   const title = "⚠️ 节点 IP 质量检测";
-  $notify(title, "失败", message);
-  const html =
-    `<div style="font-family:-apple-system;text-align:center;padding:8px 4px">` +
-    `<div style="font-size:36px;line-height:1.2">⚠️</div>` +
-    `<div style="margin-top:10px;font-size:15px;font-weight:600;color:#FF453A;line-height:1.4">${escapeHtml(message)}</div>` +
-    `</div>`;
+  const msg = String(message || "未知错误");
+  try {
+    $notify(title, "失败", msg);
+  } catch (e) {}
   $done({
-    title,
-    htmlMessage: html,
+    title: title,
+    htmlMessage:
+      '<div style="font-family:-apple-system;text-align:center;padding:12px">' +
+      '<div style="font-size:32px">⚠️</div>' +
+      '<div style="margin-top:10px;font-size:15px;font-weight:600;color:#FF453A;line-height:1.4">' +
+      escapeHtml(msg) +
+      "</div>" +
+      '<div style="margin-top:12px;font-size:12px;color:#8e8e93;line-height:1.4">可尝试：长按节点运行 · 开启 Tunnel · argument=block=0</div>' +
+      "</div>",
     icon: "exclamationmark.triangle.fill",
     "icon-color": "#FF453A",
   });
