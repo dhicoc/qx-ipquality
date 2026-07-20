@@ -1,24 +1,23 @@
 /**
  * 节点 IP 质量检测 · Quantumult X
  *
- * 功能：出口 IP + IPPure 纯净度 + 可选连通/阻断诊断
- * 用法：长按节点 → 本脚本
- * 参数：mask=0&pure=1&block=1
+ * 针对 event-interaction 约 20s 硬超时优化：
+ * - 出口 IP 用纯文本 + 正则（避免 JSON 解析失败）
+ * - 默认不做 check-host / Globalping（最耗时）
+ * - 每路请求限时，总流程目标 < 12s 必 $done
  *
- * 若曾出现「无有效内容」：多为脚本超时未 $done 或配置 API 挂起。
- * 本版强制总超时收尾，并给配置读取加超时。
+ * 长按节点运行。参数：mask=0&pure=1&block=0
+ * block=1 仅做本机/节点连通对比；block=full 才开远端 TCP（慢）
  *
  * @Updated: 2026-07-20
  */
 
-const VERSION = "2026-07-20.qx4.1";
+const VERSION = "2026-07-20.qx4.2";
 const UA =
   "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 Version/16.0 Mobile/15E148 Safari/604.1";
 const IPPURE_URL = "https://my.ippure.com/v1/info";
-const IP_API_BASE = "http://ip-api.com/json";
-const CHECK_HOST = "https://check-host.net";
-const GP_API = "https://api.globalping.io/v1/measurements";
-const HARD_LIMIT_MS = 18000;
+const REQ_MS = 5000;
+const HARD_MS = 14000;
 
 const envVars =
   typeof $environment !== "undefined" && $environment.variables
@@ -28,27 +27,22 @@ const argRaw =
   typeof $argument !== "undefined" && $argument != null ? String($argument) : "";
 const args = Object.assign({}, envVars, parseArgument(argRaw));
 
-const UI_NODE = readUINode();
-const ARG_POLICY = clean(args.policy || args.node || "");
-const BARE_POLICY =
-  !ARG_POLICY && argRaw && argRaw.indexOf("=") < 0 ? clean(argRaw) : "";
-const POLICY = UI_NODE || ARG_POLICY || BARE_POLICY;
-const FROM_UI = !!UI_NODE;
+const POLICY = resolvePolicy();
+const FROM_UI = !!readUINode();
 const MASK_IP = isTruthy(args.mask, false);
 const PURE_ON = isTruthy(args.pure, true);
-// 默认关闭远端 TCP（最易超时）；需要时 argument=block=1
-const BLOCK_ON = isTruthy(args.block, false);
+// block: 0/false 关闭；1/true 轻量连通；full 远端 TCP（易超时，不推荐）
+const BLOCK_MODE = normalizeBlockMode(args.block);
 
 const lines = [];
 const warn = [];
 let finished = false;
 
-// 总超时：保证一定有返回
 setTimeout(function () {
   if (!finished) {
-    fail("检测超时（可改 argument=block=0 或检查 Tunnel/节点名）");
+    failSoft("脚本即将被 QX 强制结束，已尽量返回已有结果");
   }
-}, HARD_LIMIT_MS);
+}, HARD_MS);
 
 main().catch(function (e) {
   fail("异常: " + err(e));
@@ -63,116 +57,162 @@ async function main() {
       " pure=" +
       PURE_ON +
       " block=" +
-      BLOCK_ON
+      BLOCK_MODE
   );
 
   if (!POLICY) {
-    warn.push("未指定节点：走默认路由。请长按目标节点再运行");
+    warn.push("未指定节点：走默认路由。请长按目标节点");
   }
 
-  // ① 核心：出口 + 纯净度（必须在数秒内出结果）
-  const core = await Promise.all([
-    safe(discoverIP(), ""),
-    PURE_ON ? safe(fetchIPPure(), null) : Promise.resolve(null),
-    BLOCK_ON ? safe(checkDirectNet(), { ok: null }) : Promise.resolve({ ok: null }),
-    BLOCK_ON && POLICY
-      ? safe(withTimeout(getServerHostPort(POLICY), 2500, null), null)
-      : Promise.resolve(null),
-  ]);
-
-  const ip = core[0];
-  const ipure = core[1];
-  const direct = core[2] || { ok: null };
-  const serverEP = core[3];
+  // ── 阶段 1：出口 IP（文本探针，快）────────────────────
+  const ip = await withTimeout(discoverIP(), 7000, "");
+  const ipure =
+    PURE_ON && ip
+      ? await withTimeout(fetchIPPure(), REQ_MS, null)
+      : PURE_ON && !ip
+        ? await withTimeout(fetchIPPure(), REQ_MS, null)
+        : null;
 
   const egressIP = ip || normalizeIP(ipure && ipure.ip) || "";
 
   if (!egressIP) {
-    if (BLOCK_ON && POLICY) {
-      const remote = serverEP
-        ? await safe(checkHostRemote(serverEP.host, serverEP.port), {
-            ok: false,
-            error: "远端探测失败",
-            items: [],
-          })
-        : { ok: false, error: "无节点地址", items: [] };
-      let gp = null;
-      if (direct.ok && remote.ok && serverEP) {
-        gp = await safe(runGlobalping(serverEP.host, serverEP.port), null);
-      }
-      const block = buildBlockReport({
-        nodeOk: false,
-        directOk: direct.ok === true,
-        remote: remote,
-        gp: gp,
-        nodeIp: "",
-        nodeLoc: "",
-      });
-      renderFailureWithBlock(block);
+    // 轻量连通信息（不跑远端）
+    let directOk = null;
+    if (BLOCK_MODE !== "0") {
+      directOk = await withTimeout(
+        checkDirectNet().then(function (r) {
+          return r.ok;
+        }),
+        4000,
+        null
+      );
+    }
+    const block =
+      BLOCK_MODE !== "0"
+        ? {
+            nodeOk: false,
+            directOk: directOk,
+            remoteOk: null,
+            remoteItems: [],
+            remoteError: "",
+            nodeIp: "",
+            nodeLoc: "",
+            conclusion:
+              directOk === false
+                ? "⚠️ 本机网络异常"
+                : "💤 节点代理不可达（未拿到出口 IP）",
+          }
+        : null;
+    if (block) {
+      renderPartialFail(block);
       return;
     }
     fail(
       POLICY
-        ? "无法经「" + POLICY + "」获取出口 IP（检查节点名 / Tunnel）"
-        : "无法获取出口 IP（检查网络 / Tunnel）"
+        ? "无法经「" + POLICY + "」获取出口 IP（检查节点/Tunnel；日志里 JSON 失败可忽略）"
+        : "无法获取出口 IP"
     );
     return;
   }
 
-  // ② 详情库（直连查 IP，失败不影响出结果）
-  const detail = await Promise.all([
-    safe(
+  // ── 阶段 2：详情并行（各自限时）──────────────────────
+  const jobs = [
+    withTimeout(
       fetchJson(
-        IP_API_BASE +
-          "/" +
+        "http://ip-api.com/json/" +
           egressIP +
-          "?lang=zh-CN&fields=status,message,country,countryCode,regionName,city,lat,lon,timezone,isp,org,as,asname,mobile,proxy,hosting,query",
+          "?lang=zh-CN&fields=status,message,country,countryCode,regionName,city,timezone,isp,org,as,asname,mobile,proxy,hosting,query",
         { mode: "direct" }
       ),
+      REQ_MS,
       null
     ),
-    safe(
+    withTimeout(
       fetchJson("https://api.ipapi.is/?q=" + encodeURIComponent(egressIP), {
         mode: "direct",
       }),
+      REQ_MS,
       null
     ),
-    BLOCK_ON && serverEP
-      ? safe(checkHostRemote(serverEP.host, serverEP.port), {
-          ok: false,
-          error: "远端探测失败",
-          items: [],
-        })
-      : Promise.resolve(null),
-  ]);
+  ];
 
-  const ipApi = detail[0];
-  const ipapiIs = detail[1];
-  const remote = detail[2];
+  if (PURE_ON && !ipure) {
+    jobs.push(withTimeout(fetchIPPure(), REQ_MS, null));
+  } else {
+    jobs.push(Promise.resolve(ipure));
+  }
+
+  if (BLOCK_MODE !== "0") {
+    jobs.push(
+      withTimeout(
+        checkDirectNet().then(function (r) {
+          return r.ok;
+        }),
+        4000,
+        null
+      )
+    );
+  } else {
+    jobs.push(Promise.resolve(null));
+  }
+
+  // full 才做远端（额外约 3s，可能顶满超时）
+  if (BLOCK_MODE === "full" && POLICY) {
+    jobs.push(
+      withTimeout(
+        getServerHostPort(POLICY).then(function (ep) {
+          if (!ep) return { ok: false, error: "无节点地址", items: [] };
+          return checkHostRemote(ep.host, ep.port);
+        }),
+        8000,
+        { ok: false, error: "远端探测超时", items: [] }
+      )
+    );
+  } else {
+    jobs.push(Promise.resolve(null));
+  }
+
+  const pack = await Promise.all(jobs);
+  const ipApi = pack[0];
+  const ipapiIs = pack[1];
+  const pureData = pack[2];
+  const directOk = pack[3];
+  const remote = pack[4];
 
   if (!ipApi) warn.push("ip-api 详情未返回");
   if (!ipapiIs) warn.push("ipapi.is 未返回");
-  if (PURE_ON && !ipure) warn.push("IPPure 未返回");
+  if (PURE_ON && !pureData) warn.push("IPPure 未返回");
 
-  const basic = buildBasic(egressIP, ipApi, ipapiIs, ipure);
-  const pure = buildPure(ipure);
-  const risks = buildRisks(ipApi, ipapiIs, ipure);
-  const block = BLOCK_ON
-    ? buildBlockReport({
-        nodeOk: true,
-        directOk: direct.ok === null ? null : !!direct.ok,
-        remote: remote,
-        gp: null,
-        nodeIp: displayIP(egressIP),
-        nodeLoc: basic.region || basic.city || "",
-      })
-    : null;
+  const basic = buildBasic(egressIP, ipApi, ipapiIs, pureData);
+  const pure = buildPure(pureData);
+  const risks = buildRisks(ipApi, ipapiIs, pureData);
+  const block =
+    BLOCK_MODE === "0"
+      ? null
+      : {
+          nodeOk: true,
+          directOk: directOk,
+          remoteOk: remote == null ? null : !!remote.ok,
+          remoteItems: (remote && remote.items) || [],
+          remoteError: (remote && remote.error) || "",
+          nodeIp: displayIP(egressIP),
+          nodeLoc: basic.region || basic.city || "",
+          conclusion: buildConclusion(true, directOk, remote),
+        };
 
-  const theme = resultTheme(basic, risks, pure);
-  renderAll(basic, risks, pure, block, theme);
+  renderAll(basic, risks, pure, block, resultTheme(basic, risks, pure));
 }
 
-// ── 读取长按节点 ─────────────────────────────────────────
+// ── Policy ───────────────────────────────────────────────
+
+function resolvePolicy() {
+  const ui = readUINode();
+  if (ui) return ui;
+  const p = clean(args.policy || args.node || "");
+  if (p) return p;
+  if (argRaw && argRaw.indexOf("=") < 0) return clean(argRaw);
+  return "";
+}
 
 function readUINode() {
   try {
@@ -182,7 +222,6 @@ function readUINode() {
     const p = $environment.params;
     if (typeof p === "string") return clean(p);
     if (typeof p === "object") {
-      // 兼容偶发对象形态
       return clean(p.node || p.policy || p.name || p.tag || "");
     }
     return clean(String(p));
@@ -191,84 +230,86 @@ function readUINode() {
   }
 }
 
-// ── 出口 / 纯净 / 阻断 ───────────────────────────────────
+function normalizeBlockMode(v) {
+  if (v == null || v === "") return "0";
+  const t = String(v).toLowerCase();
+  if (t === "full" || t === "2") return "full";
+  if (t === "1" || t === "true" || t === "yes" || t === "on") return "1";
+  return "0";
+}
+
+// ── 出口探测（文本优先）──────────────────────────────────
 
 async function discoverIP() {
-  const probes = [
-    function () {
-      return fetchJson("https://api4.ipify.org?format=json", {
-        mode: "node",
-      }).then(function (j) {
-        return j && j.ip;
-      });
-    },
-    function () {
-      return fetchJson(IP_API_BASE + "?lang=zh-CN&fields=status,query", {
-        mode: "node",
-      }).then(function (j) {
-        return j && j.status === "success" && j.query;
-      });
-    },
-    function () {
-      return fetchText("https://ipv4.icanhazip.com/", { mode: "node" }).then(
-        function (t) {
-          return t && String(t).trim();
-        }
-      );
-    },
+  // 全部当文本处理，再用正则抠 IPv4（ipify 偶发非 JSON）
+  const urls = [
+    "https://api4.ipify.org",
+    "https://api.ipify.org",
+    "https://ipv4.icanhazip.com/",
+    "https://v4.ident.me/",
+    "http://ip-api.com/json?lang=zh-CN&fields=query,status",
   ];
 
-  const settled = await Promise.all(
-    probes.map(function (run, idx) {
-      return run()
-        .then(function (v) {
-          return { name: "p" + idx, ip: normalizeIP(v) };
-        })
-        .catch(function (e) {
-          log("probe " + idx + ": " + err(e));
-          return { name: "p" + idx, ip: "" };
-        });
+  const results = await Promise.all(
+    urls.map(function (url) {
+      return withTimeout(
+        fetchText(url, { mode: "node" }).then(function (body) {
+          return extractIPv4(body);
+        }),
+        REQ_MS,
+        ""
+      ).catch(function () {
+        return "";
+      });
     })
   );
 
-  const valid = settled.filter(function (r) {
-    return r.ip;
-  });
-  if (!valid.length) return "";
+  const valid = results.filter(Boolean);
+  if (!valid.length) {
+    log("discoverIP: all probes empty");
+    return "";
+  }
 
   const counts = {};
-  valid.forEach(function (r) {
-    counts[r.ip] = (counts[r.ip] || 0) + 1;
+  valid.forEach(function (ip) {
+    counts[ip] = (counts[ip] || 0) + 1;
   });
   const ranked = Object.keys(counts).sort(function (a, b) {
     return counts[b] - counts[a];
   });
   if (ranked.length > 1) {
-    warn.push(
-      "出口不一致: " +
-        valid
-          .map(function (r) {
-            return r.name + "=" + r.ip;
-          })
-          .join(", ")
-    );
+    warn.push("出口探针不一致: " + ranked.join(" / "));
   }
+  log("discoverIP: " + ranked[0] + " (" + valid.length + " hits)");
   return ranked[0];
+}
+
+function extractIPv4(text) {
+  if (text == null) return "";
+  const s = String(text);
+  // JSON query/ip 字段
+  let m = s.match(/"query"\s*:\s*"(\d{1,3}(?:\.\d{1,3}){3})"/);
+  if (m) return normalizeIP(m[1]);
+  m = s.match(/"ip"\s*:\s*"(\d{1,3}(?:\.\d{1,3}){3})"/);
+  if (m) return normalizeIP(m[1]);
+  // 纯文本
+  m = s.match(/\b(\d{1,3}(?:\.\d{1,3}){3})\b/);
+  return m ? normalizeIP(m[1]) : "";
 }
 
 function fetchIPPure() {
   return fetchJson(IPPURE_URL, { mode: "node" }).then(function (data) {
-    if (!data || typeof data !== "object") throw new Error("IPPure 空响应");
+    if (!data || typeof data !== "object") throw new Error("IPPure 空");
     return data;
   });
 }
 
 function checkDirectNet() {
-  return fetchJson(IP_API_BASE + "?lang=zh-CN&fields=status,query", {
+  return fetchText("http://ip-api.com/json?lang=zh-CN&fields=status,query", {
     mode: "direct",
   })
-    .then(function (j) {
-      return { ok: !!(j && j.status === "success") };
+    .then(function (body) {
+      return { ok: /"status"\s*:\s*"success"/.test(body) || !!extractIPv4(body) };
     })
     .catch(function () {
       return { ok: false };
@@ -290,21 +331,17 @@ function getServerHostPort(tag) {
         action: "get_server_description",
         content: tag,
       });
-      // 兼容 Promise / 同步返回
+      const finish = function (msg) {
+        resolve(parseHostPort(msg, tag));
+      };
       if (ret && typeof ret.then === "function") {
-        ret.then(
-          function (msg) {
-            resolve(parseHostPort(msg, tag));
-          },
-          function () {
-            resolve(null);
-          }
-        );
+        ret.then(finish, function () {
+          resolve(null);
+        });
       } else {
-        resolve(parseHostPort(ret, tag));
+        finish(ret);
       }
     } catch (e) {
-      log("getServerHostPort: " + err(e));
       resolve(null);
     }
   });
@@ -324,11 +361,21 @@ function parseHostPort(msg, tag) {
     if (eq < 0) return null;
     const after = desc.substring(eq + 1);
     const comma = after.indexOf(",");
-    const hp = comma < 0 ? after : after.substring(0, comma);
-    const colon = hp.lastIndexOf(":");
-    if (colon < 0) return null;
-    const host = hp.substring(0, colon).trim();
-    const port = hp.substring(colon + 1).trim();
+    const hp = (comma < 0 ? after : after.substring(0, comma)).trim();
+    // 支持 [ipv6]:port 与 host:port
+    let host = "";
+    let port = "";
+    if (hp.charAt(0) === "[") {
+      const end = hp.indexOf("]");
+      if (end < 0) return null;
+      host = hp.substring(1, end);
+      if (hp.charAt(end + 1) === ":") port = hp.substring(end + 2);
+    } else {
+      const colon = hp.lastIndexOf(":");
+      if (colon < 0) return null;
+      host = hp.substring(0, colon).trim();
+      port = hp.substring(colon + 1).trim();
+    }
     if (!host || !/^\d+$/.test(port)) return null;
     return { host: host, port: port };
   } catch (e) {
@@ -339,19 +386,19 @@ function parseHostPort(msg, tag) {
 async function checkHostRemote(host, port) {
   const target = host + ":" + port;
   const submit = await fetchJson(
-    CHECK_HOST +
-      "/check-tcp?host=" +
+    "https://check-host.net/check-tcp?host=" +
       encodeURIComponent(target) +
-      "&max_nodes=6",
+      "&max_nodes=5",
     { mode: "direct" }
   );
   if (!submit || !submit.ok || !submit.request_id) {
     return { ok: false, error: "提交失败", items: [] };
   }
-  await sleep(3000);
-  const res = await fetchJson(CHECK_HOST + "/check-result/" + submit.request_id, {
-    mode: "direct",
-  });
+  await sleep(2800);
+  const res = await fetchJson(
+    "https://check-host.net/check-result/" + submit.request_id,
+    { mode: "direct" }
+  );
   const nodeList = submit.nodes || {};
   const names = Object.keys(nodeList);
   let reachable = false;
@@ -364,7 +411,7 @@ async function checkHostRemote(host, port) {
     let ms = "--ms";
     if (nr && nr.length && nr[0] && nr[0].time !== undefined) {
       reachable = true;
-      ms = formatMs(nr[0].time * 1000);
+      ms = Math.round(nr[0].time * 1000) + "ms";
     }
     items.push({ flag: flag, ms: ms });
   });
@@ -375,32 +422,19 @@ async function checkHostRemote(host, port) {
   };
 }
 
-async function runGlobalping(host, port) {
-  const created = await fetchJson(GP_API, {
-    method: "POST",
-    mode: "direct",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      "User-Agent": UA,
-    },
-    body: JSON.stringify({
-      type: "ping",
-      target: host,
-      measurementOptions: { port: parseInt(port, 10), protocol: "TCP" },
-      locations: [{ country: "CN", tags: ["eyeball-network"] }],
-      limit: 8,
-    }),
-  });
-  if (!created || !created.id) return null;
-  await sleep(5000);
-  return fetchJson(GP_API + "/" + created.id, {
-    mode: "direct",
-    headers: { Accept: "application/json", "User-Agent": UA },
-  });
+function buildConclusion(nodeOk, directOk, remote) {
+  if (directOk === false) return "⚠️ 本机网络异常";
+  if (nodeOk && remote == null) return "✅ 节点代理可达";
+  if (nodeOk && remote && remote.ok) return "✅ 节点正常";
+  if (nodeOk && remote && !remote.ok) {
+    return "⚠️ 代理可达，服务端口远端探测失败";
+  }
+  if (!nodeOk && remote && remote.ok) return "🚫 疑似被运营商/GFW 阻断";
+  if (!nodeOk) return "💤 节点离线";
+  return "❓ 数据不完整";
 }
 
-// ── 数据组装 ─────────────────────────────────────────────
+// ── 组装 ─────────────────────────────────────────────────
 
 function buildBasic(ip, ipApi, ipapiIs, ipure) {
   const okApi = ipApi && ipApi.status === "success" ? ipApi : null;
@@ -466,19 +500,19 @@ function classifyNature(okApi, ipapiIs, ipure) {
     }
     return "机房 IP · 数据中心，IPPure";
   }
-  const hosting =
-    !!(okApi && okApi.hosting) ||
-    !!(ipapiIs && (ipapiIs.is_datacenter || ipapiIs.is_hosting));
-  const mobile = !!(okApi && okApi.mobile) || !!(ipapiIs && ipapiIs.is_mobile);
-  const proxyLike =
-    !!(okApi && okApi.proxy) ||
-    !!(ipapiIs && (ipapiIs.is_proxy || ipapiIs.is_vpn || ipapiIs.is_tor));
-  if (hosting) return "机房 IP · 服务器/数据中心，一般不是家用宽带";
-  if (mobile) return "移动 IP · 手机/蜂窝流量网络";
-  if (proxyLike) return "代理特征 · 库标记像代理/VPN（仅供参考）";
-  if (okApi || ipapiIs) {
-    return "家宽倾向 · 未检出机房/移动标记（不等于已认证住宅）";
+  if ((okApi && okApi.hosting) || (ipapiIs && (ipapiIs.is_datacenter || ipapiIs.is_hosting))) {
+    return "机房 IP · 服务器/数据中心";
   }
+  if ((okApi && okApi.mobile) || (ipapiIs && ipapiIs.is_mobile)) {
+    return "移动 IP · 蜂窝网络";
+  }
+  if (
+    (okApi && okApi.proxy) ||
+    (ipapiIs && (ipapiIs.is_proxy || ipapiIs.is_vpn || ipapiIs.is_tor))
+  ) {
+    return "代理特征 · 库标记像代理/VPN";
+  }
+  if (okApi || ipapiIs) return "家宽倾向 · 未检出机房/移动标记";
   return "";
 }
 
@@ -524,28 +558,29 @@ function buildRisks(ipApi, ipapiIs, ipure) {
   const out = [];
   if (ipure && numberOrNull(ipure.fraudScore) !== null) {
     const s = numberOrNull(ipure.fraudScore);
-    out.push(
-      riskItem(
-        s > 75 ? "bad" : s > 50 ? "warn" : "ok",
+    out.push({
+      level: s > 75 ? "bad" : s > 50 ? "warn" : "ok",
+      icon: s > 75 ? "🔴" : s > 50 ? "🟠" : "🟢",
+      text:
         "IPPure　欺诈值 " +
-          s +
-          " · " +
-          (s <= 25 ? "低" : s <= 50 ? "中" : s <= 75 ? "高" : "极高") +
-          "风险"
-      )
-    );
+        s +
+        " · " +
+        (s <= 25 ? "低" : s <= 50 ? "中" : s <= 75 ? "高" : "极高") +
+        "风险",
+    });
   }
-  const okApi = ipApi && ipApi.status === "success" ? ipApi : null;
-  if (okApi) {
+  if (ipApi && ipApi.status === "success") {
     const flags = [];
-    if (okApi.proxy) flags.push("代理");
-    if (okApi.hosting) flags.push("托管");
-    if (okApi.mobile) flags.push("移动");
-    out.push(
-      flags.length
-        ? riskItem("warn", "ip-api　命中 " + flags.join("、"))
-        : riskItem("ok", "ip-api　未命中 proxy/hosting")
-    );
+    if (ipApi.proxy) flags.push("代理");
+    if (ipApi.hosting) flags.push("托管");
+    if (ipApi.mobile) flags.push("移动");
+    out.push({
+      level: flags.length ? "warn" : "ok",
+      icon: flags.length ? "🟠" : "🟢",
+      text: flags.length
+        ? "ip-api　命中 " + flags.join("、")
+        : "ip-api　未命中 proxy/hosting",
+    });
   }
   if (ipapiIs && typeof ipapiIs === "object") {
     const flags = [];
@@ -554,118 +589,15 @@ function buildRisks(ipApi, ipapiIs, ipure) {
     if (ipapiIs.is_tor) flags.push("Tor");
     if (ipapiIs.is_datacenter) flags.push("机房");
     if (ipapiIs.is_abuser) flags.push("滥用");
-    out.push(
-      flags.length
-        ? riskItem("warn", "ipapi.is　命中 " + flags.join("、"))
-        : riskItem("ok", "ipapi.is　无风险标记")
-    );
+    out.push({
+      level: flags.length ? "warn" : "ok",
+      icon: flags.length ? "🟠" : "🟢",
+      text: flags.length
+        ? "ipapi.is　命中 " + flags.join("、")
+        : "ipapi.is　无风险标记",
+    });
   }
   return out;
-}
-
-function buildBlockReport(ctx) {
-  const nodeOk = !!ctx.nodeOk;
-  const directOk = ctx.directOk;
-  const remote = ctx.remote;
-  const rOk = remote && remote.ok;
-  let conclusion = "❓ 数据不完整";
-  let gpAnalysis = null;
-
-  if (directOk === false) {
-    conclusion = "⚠️ 本机网络异常";
-  } else if (nodeOk && (rOk || remote == null)) {
-    conclusion = rOk === false
-      ? "⚠️ 节点可代理，但服务端口远端探测失败"
-      : "✅ 节点正常";
-  } else if (!nodeOk && rOk && directOk) {
-    if (ctx.gp && ctx.gp.results) {
-      gpAnalysis = analyzeBlockSource(ctx.gp);
-      conclusion = gpAnalysis.conclusion;
-    } else {
-      conclusion = "🚫 疑似被运营商/GFW 阻断";
-    }
-  } else if (!nodeOk && !rOk && directOk) {
-    conclusion = "💤 节点离线";
-  }
-
-  return {
-    nodeOk: nodeOk,
-    directOk: directOk,
-    remoteOk: remote == null ? null : !!rOk,
-    remoteError: (remote && remote.error) || "",
-    remoteItems: (remote && remote.items) || [],
-    nodeIp: ctx.nodeIp || "",
-    nodeLoc: ctx.nodeLoc || "",
-    conclusion: conclusion,
-    gpAnalysis: gpAnalysis,
-  };
-}
-
-function analyzeBlockSource(gpData) {
-  const results = gpData.results || [];
-  const ispGroups = {};
-  results.forEach(function (r) {
-    const isp = classifyISP(r.probe && r.probe.network);
-    if (!isp) return;
-    if (!ispGroups[isp]) ispGroups[isp] = { probes: [], reachable: false };
-    const res = r.result || {};
-    const stats = res.stats;
-    let ok = false;
-    let ms = "--ms";
-    if (res.status === "finished" && stats) {
-      ok = stats.rcv > 0;
-      ms = ok ? formatMs(stats.avg || 0) : "--ms";
-    }
-    if (ok) ispGroups[isp].reachable = true;
-    ispGroups[isp].probes.push({
-      city: cnCity(r.probe.city),
-      ok: ok,
-      ms: ms,
-    });
-  });
-  const reachableIsps = [];
-  const blockedIsps = [];
-  Object.keys(ispGroups).forEach(function (k) {
-    if (!ispGroups[k].probes.length) return;
-    if (ispGroups[k].reachable) reachableIsps.push(k);
-    else blockedIsps.push(k);
-  });
-  let conclusion;
-  if (!reachableIsps.length) {
-    conclusion = "🚫 GFW 全局阻断 — 国内三大运营商均无法访问";
-  } else if (blockedIsps.length) {
-    conclusion =
-      "🚫 运营商级拦截 — " +
-      blockedIsps.join("、") +
-      " 不可达，" +
-      reachableIsps.join("、") +
-      " 正常";
-  } else {
-    conclusion = "✅ 国内三大运营商全部可达，请检查客户端配置";
-  }
-  return { ispGroups: ispGroups, conclusion: conclusion };
-}
-
-function classifyISP(network) {
-  const n = String(network || "").toLowerCase();
-  if (n.indexOf("unicom") >= 0) return "中国联通";
-  if (n.indexOf("chinanet") >= 0 || n.indexOf("telecom") >= 0) return "中国电信";
-  if (n.indexOf("mobile") >= 0) return "中国移动";
-  return null;
-}
-
-function cnCity(en) {
-  const map = {
-    Beijing: "北京",
-    Shanghai: "上海",
-    Guangzhou: "广州",
-    Shenzhen: "深圳",
-    Chengdu: "成都",
-    Hangzhou: "杭州",
-    Wuhan: "武汉",
-    Nanjing: "南京",
-  };
-  return map[en] || en || "";
 }
 
 // ── 渲染 ─────────────────────────────────────────────────
@@ -699,26 +631,17 @@ function renderAll(basic, risks, pure, block, theme) {
 
   if (block) {
     lines.push("");
-    lines.push("🔗 连通 / 阻断");
+    lines.push("🔗 连通");
     lines.push("　节点代理　" + (block.nodeOk ? "✅ 正常" : "❌ 不可达"));
-    if (block.directOk !== null) {
-      lines.push("　本机网络　" + (block.directOk ? "✅ 正常" : "❌ 异常"));
+    if (block.directOk !== null && block.directOk !== undefined) {
+      lines.push(
+        "　本机网络　" + (block.directOk ? "✅ 正常" : "❌ 异常")
+      );
     }
-    if (block.remoteOk !== null) {
-      lines.push("　远端探测　" + (block.remoteOk ? "✅ 可达" : "❌ 不可达"));
-      if (block.remoteItems.length) {
-        lines.push(
-          "　" +
-            block.remoteItems
-              .slice(0, 6)
-              .map(function (it) {
-                return it.flag + " " + it.ms;
-              })
-              .join("  ")
-        );
-      } else if (block.remoteError) {
-        lines.push("　" + block.remoteError);
-      }
+    if (block.remoteOk !== null && block.remoteOk !== undefined) {
+      lines.push(
+        "　远端探测　" + (block.remoteOk ? "✅ 可达" : "❌ 不可达")
+      );
     }
     lines.push("　结论　" + block.conclusion);
   }
@@ -726,109 +649,64 @@ function renderAll(basic, risks, pure, block, theme) {
   if (warn.length) {
     lines.push("");
     lines.push("💡 提示");
-    warn.slice(0, 5).forEach(function (w) {
+    warn.slice(0, 4).forEach(function (w) {
       lines.push("　⚠️ " + w);
     });
   }
 
-  const title = theme.titleEmoji + " 节点 IP 质量检测";
-  const subtitle = POLICY || "默认路由";
-  const body = lines.join("\n");
-  const html = buildResultHtml(basic, risks, pure, block, warn, theme);
-  doneOK(title, subtitle, body, html, theme);
+  lines.push("");
+  lines.push("v" + VERSION);
+
+  doneOK(
+    theme.titleEmoji + " 节点 IP 质量检测",
+    POLICY || "默认路由",
+    lines.join("\n"),
+    buildHtml(basic, risks, pure, block, theme),
+    theme
+  );
 }
 
-function renderFailureWithBlock(block) {
-  lines.push("🔗 连通 / 阻断");
+function renderPartialFail(block) {
+  lines.push("🔗 连通");
   lines.push("　节点代理　❌ 不可达");
   if (block.directOk !== null) {
     lines.push("　本机网络　" + (block.directOk ? "✅ 正常" : "❌ 异常"));
   }
-  if (block.remoteOk !== null) {
-    lines.push("　远端探测　" + (block.remoteOk ? "✅ 可达" : "❌ 不可达"));
-  }
   lines.push("　结论　" + block.conclusion);
   if (POLICY) lines.push("📡 节点　" + POLICY);
-
-  const title = "🌐 节点 IP 质量检测";
-  const body = lines.join("\n");
-  const html =
-    '<div style="font-family:-apple-system;font-size:14px;line-height:1.45;text-align:left">' +
-    htmlSection("🔗 连通 / 阻断") +
-    htmlBlockSection(block) +
-    (POLICY ? htmlRow("📡", "节点", POLICY) : "") +
-    "</div>";
-  doneOK(title, POLICY || "失败", body, html, {
-    sfSymbol: "exclamationmark.triangle.fill",
-    color: "#FF453A",
-  });
-}
-
-function riskItem(level, text) {
-  return {
-    level: level,
-    text: text,
-    icon: level === "bad" ? "🔴" : level === "warn" ? "🟠" : "🟢",
-  };
+  lines.push("");
+  lines.push("v" + VERSION);
+  doneOK(
+    "🌐 节点 IP 质量检测",
+    POLICY || "失败",
+    lines.join("\n"),
+    '<div style="font-family:-apple-system;font-size:14px;padding:8px;line-height:1.5">' +
+      escapeHtml(lines.join("\n")).replace(/\n/g, "<br/>") +
+      "</div>",
+    { sfSymbol: "exclamationmark.triangle.fill", color: "#FF453A" }
+  );
 }
 
 function resultTheme(basic, risks, pure) {
-  const nature = (basic && basic.nature) || "";
-  const hasWarn = (risks || []).some(function (r) {
-    return r.level === "warn" || r.level === "bad";
-  });
-  if (pure && pure.levelKey === "critical") {
-    return {
-      titleEmoji: "‼️",
-      natureEmoji: "🖥️",
-      sfSymbol: "xmark.shield.fill",
-      color: "#FF453A",
-      badge: "极高风险",
-    };
-  }
   if (pure && pure.isResidential === true) {
     return {
       titleEmoji: "🏠",
       natureEmoji: "🏠",
       sfSymbol: "house.fill",
       color: "#30D158",
-      badge: pure.isBroadcast ? "住宅·广播" : "住宅",
+      badge: "住宅",
     };
   }
-  if (pure && pure.isResidential === false) {
+  if (
+    (pure && pure.isResidential === false) ||
+    (basic.nature && basic.nature.indexOf("机房") >= 0)
+  ) {
     return {
       titleEmoji: "🖥️",
       natureEmoji: "🖥️",
       sfSymbol: "server.rack",
       color: "#FF9F0A",
       badge: "机房",
-    };
-  }
-  if (nature.indexOf("机房") >= 0) {
-    return {
-      titleEmoji: "🖥️",
-      natureEmoji: "🖥️",
-      sfSymbol: "server.rack",
-      color: "#FF9F0A",
-      badge: "机房",
-    };
-  }
-  if (nature.indexOf("家宽") >= 0 || nature.indexOf("住宅") >= 0) {
-    return {
-      titleEmoji: "🏠",
-      natureEmoji: "🏠",
-      sfSymbol: "house.fill",
-      color: "#30D158",
-      badge: "家宽倾向",
-    };
-  }
-  if (hasWarn) {
-    return {
-      titleEmoji: "🛡️",
-      natureEmoji: "🕵️",
-      sfSymbol: "network.badge.shield.half.filled",
-      color: "#FF9F0A",
-      badge: "关注",
     };
   }
   return {
@@ -840,235 +718,148 @@ function resultTheme(basic, risks, pure) {
   };
 }
 
-function buildResultHtml(basic, risks, pure, block, warnings, theme) {
+function buildHtml(basic, risks, pure, block, theme) {
   const rows = [];
-  rows.push(htmlHero(displayIP(basic.ip), theme));
-  if (basic.nature) rows.push(htmlRow("🏷️", "类型", basic.nature, theme.color));
-  if (basic.region) rows.push(htmlRegionRow(basic));
-  if (basic.city) rows.push(htmlRow("🏙️", "城市", basic.city));
-  if (basic.asn) rows.push(htmlRow("🔢", "ASN", basic.asn));
-  if (basic.org) rows.push(htmlRow("🏢", "组织", basic.org));
-  if (basic.timezone) rows.push(htmlRow("🕐", "时区", basic.timezone));
-  if (POLICY) rows.push(htmlRow("📡", FROM_UI ? "节点" : "策略", POLICY));
+  rows.push(
+    '<div style="margin:0 0 12px;padding:12px;border-radius:12px;background:linear-gradient(135deg,' +
+      theme.color +
+      "22," +
+      theme.color +
+      '08)">' +
+      '<div style="font-size:11px;color:' +
+      theme.color +
+      ';font-weight:700">' +
+      escapeHtml(theme.titleEmoji + " " + theme.badge) +
+      "</div>" +
+      '<div style="margin-top:4px;font-size:22px;font-weight:800">' +
+      escapeHtml(displayIP(basic.ip)) +
+      "</div></div>"
+  );
+
+  function row(em, lab, val, color) {
+    if (!val) return;
+    rows.push(
+      '<div style="margin:0 0 9px"><div style="font-size:11px;color:#8e8e93">' +
+        escapeHtml(em + " " + lab) +
+        '</div><div style="margin-top:2px;font-size:14px;font-weight:600;color:' +
+        (color || "#1c1c1e") +
+        ';word-break:break-word">' +
+        escapeHtml(val) +
+        "</div></div>"
+    );
+  }
+
+  row("🏷️", "类型", basic.nature, theme.color);
+  if (basic.region) {
+    const img = basic.flagImg
+      ? '<img src="' +
+        escapeHtml(basic.flagImg) +
+        '" width="20" height="14" style="vertical-align:-2px;margin-right:5px;border-radius:2px"/>'
+      : "";
+    const text = String(basic.region || "")
+      .replace(/^(?:\uD83C[\uDDE6-\uDDFF]){2}\s*/g, "")
+      .trim();
+    rows.push(
+      '<div style="margin:0 0 9px"><div style="font-size:11px;color:#8e8e93">📍 地区</div>' +
+        '<div style="margin-top:2px;font-size:14px;font-weight:600">' +
+        img +
+        escapeHtml((basic.flagEmoji ? basic.flagEmoji + " " : "") + text) +
+        "</div></div>"
+    );
+  }
+  row("🏙️", "城市", basic.city);
+  row("🔢", "ASN", basic.asn);
+  row("🏢", "组织", basic.org);
+  row("🕐", "时区", basic.timezone);
+  if (POLICY) row("📡", "节点", POLICY);
 
   if (pure) {
-    rows.push(htmlSection("✨ IPPure 纯净度"));
-    rows.push(htmlRow("🏠", "网络类型", pure.type));
+    rows.push(sec("✨ IPPure 纯净度"));
+    row("🏠", "网络类型", pure.type);
     if (pure.score !== null) {
-      const c =
-        pure.levelKey === "low"
-          ? "#30D158"
-          : pure.levelKey === "mid"
-            ? "#FFD60A"
-            : pure.levelKey === "high"
-              ? "#FF9F0A"
-              : "#FF453A";
-      rows.push(
-        htmlRow("📊", "欺诈值", pure.score + " 分 · " + pure.level, c)
-      );
+      row("📊", "欺诈值", pure.score + " 分 · " + pure.level);
     }
   }
 
-  rows.push(htmlSection("🛡️ 风险"));
-  if (risks && risks.length) {
+  rows.push(sec("🛡️ 风险"));
+  if (risks.length) {
     risks.forEach(function (r) {
-      rows.push(htmlRiskLine(r));
+      const c =
+        r.level === "bad" ? "#FF453A" : r.level === "warn" ? "#FF9F0A" : "#30D158";
+      rows.push(
+        '<div style="margin:0 0 7px;font-size:13px"><span style="color:' +
+          c +
+          '">' +
+          escapeHtml(r.icon) +
+          "</span> <b>" +
+          escapeHtml(r.text) +
+          "</b></div>"
+      );
     });
   } else {
-    rows.push(htmlMuted("⚪ 本次无可用标记"));
+    rows.push(
+      '<div style="color:#8e8e93;font-size:12px;margin-bottom:8px">⚪ 本次无可用标记</div>'
+    );
   }
 
   if (block) {
-    rows.push(htmlSection("🔗 连通 / 阻断"));
-    rows.push(htmlBlockSection(block));
+    rows.push(sec("🔗 连通"));
+    row("节点", "代理", block.nodeOk ? "✅ 正常" : "❌ 不可达");
+    if (block.directOk !== null && block.directOk !== undefined) {
+      row("本机", "网络", block.directOk ? "✅ 正常" : "❌ 异常");
+    }
+    if (block.remoteOk !== null && block.remoteOk !== undefined) {
+      row("远端", "探测", block.remoteOk ? "✅ 可达" : "❌ 不可达");
+    }
+    rows.push(
+      '<div style="margin-top:8px;padding:10px;border-radius:10px;background:#f2f2f7;font-weight:700">' +
+        escapeHtml(block.conclusion) +
+        "</div>"
+    );
   }
 
-  if (warnings && warnings.length) {
-    rows.push(htmlSection("💡 提示"));
-    warnings.slice(0, 5).forEach(function (w) {
-      rows.push(htmlMuted("⚠️ " + w));
+  if (warn.length) {
+    rows.push(sec("💡 提示"));
+    warn.slice(0, 4).forEach(function (w) {
+      rows.push(
+        '<div style="color:#8e8e93;font-size:12px;margin:0 0 6px">⚠️ ' +
+          escapeHtml(w) +
+          "</div>"
+      );
     });
   }
 
   return (
-    '<div style="font-family:-apple-system,BlinkMacSystemFont,Helvetica;font-size:14px;line-height:1.45;text-align:left;color:#1c1c1e">' +
+    '<div style="font-family:-apple-system;font-size:14px;line-height:1.45;text-align:left">' +
     rows.join("") +
     "</div>"
   );
 }
 
-function htmlBlockSection(block) {
-  const parts = [];
-  parts.push(
-    htmlKV(
-      "节点代理",
-      block.nodeOk ? "✅ 正常" : "❌ 不可达",
-      block.nodeOk ? "#30D158" : "#FF453A"
-    )
-  );
-  if (block.nodeOk && block.nodeIp) {
-    parts.push(
-      htmlMuted(
-        "IP " +
-          block.nodeIp +
-          (block.nodeLoc ? " · " + block.nodeLoc : "")
-      )
-    );
-  }
-  if (block.directOk !== null) {
-    parts.push(
-      htmlKV(
-        "本机网络",
-        block.directOk ? "✅ 正常" : "❌ 异常",
-        block.directOk ? "#30D158" : "#FF453A"
-      )
-    );
-  }
-  if (block.remoteOk !== null) {
-    parts.push(
-      htmlKV(
-        "远端探测",
-        block.remoteOk ? "✅ 可达" : "❌ 不可达",
-        block.remoteOk ? "#30D158" : "#FF453A"
-      )
-    );
-    if (block.remoteItems && block.remoteItems.length) {
-      let grid = "";
-      for (let i = 0; i < Math.min(block.remoteItems.length, 8); i += 2) {
-        const a = block.remoteItems[i];
-        const b = block.remoteItems[i + 1];
-        grid +=
-          '<div style="font-size:12px;font-family:Menlo,monospace;margin:2px 0">' +
-          escapeHtml(a.flag + " " + a.ms);
-        if (b) grid += "&emsp;" + escapeHtml(b.flag + " " + b.ms);
-        grid += "</div>";
-      }
-      parts.push(grid);
-    } else if (block.remoteError) {
-      parts.push(htmlMuted(block.remoteError));
-    }
-  }
-  parts.push(
-    '<div style="margin-top:10px;padding:10px 12px;border-radius:10px;background:#f2f2f7;font-weight:700;line-height:1.4">' +
-      escapeHtml(block.conclusion) +
-      "</div>"
-  );
-  return parts.join("");
-}
-
-function htmlHero(ip, theme) {
+function sec(t) {
   return (
-    '<div style="margin:0 0 14px 0;padding:12px 14px;border-radius:12px;background:linear-gradient(135deg,' +
-    theme.color +
-    "22," +
-    theme.color +
-    "08);border:1px solid " +
-    theme.color +
-    '33">' +
-    '<div style="font-size:11px;color:' +
-    theme.color +
-    ';font-weight:700">' +
-    escapeHtml((theme.titleEmoji || "🌐") + " " + (theme.badge || "")) +
-    "</div>" +
-    '<div style="margin-top:4px;font-size:22px;font-weight:800;line-height:1.2">' +
-    escapeHtml(ip) +
-    "</div></div>"
-  );
-}
-
-function htmlRow(emoji, label, value, accent) {
-  const valueColor = accent || "#1c1c1e";
-  return (
-    '<div style="margin:0 0 10px 0">' +
-    '<div style="font-size:11px;color:#8e8e93">' +
-    escapeHtml(emoji + " " + label) +
-    "</div>" +
-    '<div style="margin-top:2px;font-size:14px;font-weight:600;color:' +
-    valueColor +
-    ';word-break:break-word">' +
-    escapeHtml(value) +
-    "</div></div>"
-  );
-}
-
-function htmlKV(label, value, color) {
-  return (
-    '<div style="margin:0 0 8px 0;font-size:13px">' +
-    '<span style="color:#8e8e93;font-weight:600">' +
-    escapeHtml(label) +
-    "</span>　" +
-    '<span style="font-weight:700;color:' +
-    (color || "#1c1c1e") +
-    '">' +
-    escapeHtml(value) +
-    "</span></div>"
-  );
-}
-
-function htmlSection(title) {
-  return (
-    '<div style="margin:14px 0 8px 0;padding-top:10px;border-top:1px solid #e5e5ea;font-size:12px;font-weight:700;color:#8e8e93">' +
-    escapeHtml(title) +
+    '<div style="margin:12px 0 8px;padding-top:10px;border-top:1px solid #e5e5ea;font-size:12px;font-weight:700;color:#8e8e93">' +
+    escapeHtml(t) +
     "</div>"
   );
 }
 
-function htmlRiskLine(risk) {
-  const color =
-    risk.level === "bad"
-      ? "#FF453A"
-      : risk.level === "warn"
-        ? "#FF9F0A"
-        : "#30D158";
-  return (
-    '<div style="margin:0 0 8px 0;font-size:13px;line-height:1.4">' +
-    '<span style="color:' +
-    color +
-    '">' +
-    escapeHtml(risk.icon) +
-    "</span> " +
-    '<span style="font-weight:600">' +
-    escapeHtml(risk.text) +
-    "</span></div>"
-  );
-}
-
-function htmlMuted(text) {
-  return (
-    '<div style="margin:0 0 8px 0;font-size:12px;color:#8e8e93;line-height:1.4">' +
-    escapeHtml(text) +
-    "</div>"
-  );
-}
-
-function htmlRegionRow(basic) {
-  const img = basic.flagImg
-    ? '<img src="' +
-      escapeHtml(basic.flagImg) +
-      '" width="22" height="16" alt="" style="vertical-align:-2px;margin-right:6px;border-radius:2px" />'
-    : "";
-  const emoji = basic.flagEmoji ? escapeHtml(basic.flagEmoji) + " " : "";
-  const text = String(basic.region || "")
-    .replace(/^(?:\uD83C[\uDDE6-\uDDFF]){2}\s*/g, "")
-    .trim();
-  return (
-    '<div style="margin:0 0 10px 0">' +
-    '<div style="font-size:11px;color:#8e8e93">📍 地区</div>' +
-    '<div style="margin-top:2px;font-size:14px;font-weight:600;line-height:1.35">' +
-    img +
-    emoji +
-    escapeHtml(text) +
-    "</div></div>"
-  );
-}
-
-// ── HTTP（兼容 QX）──────────────────────────────────────
+// ── HTTP ─────────────────────────────────────────────────
 
 function fetchJson(url, options) {
   return fetchRaw(url, options).then(function (r) {
+    const body = String(r.body || "").trim();
+    if (!body) throw new Error("空响应");
     try {
-      return JSON.parse(r.body || "");
+      return JSON.parse(body);
     } catch (e) {
+      // 有时带 BOM / 前后杂质
+      const m = body.match(/\{[\s\S]*\}/);
+      if (m) {
+        try {
+          return JSON.parse(m[0]);
+        } catch (e2) {}
+      }
       throw new Error("JSON 解析失败");
     }
   });
@@ -1080,40 +871,39 @@ function fetchText(url, options) {
   });
 }
 
-/**
- * mode:
- *   "node"   → 绑 POLICY（长按节点）
- *   "direct" → 尝试 direct；失败则不带 policy 重试
- *   "auto"   → 不绑策略
- */
 function fetchRaw(url, options) {
   const opt = options || {};
   const mode = opt.mode || "node";
 
-  function once(usePolicy) {
+  function once(policy) {
     return new Promise(function (resolve, reject) {
       const req = {
         url: url,
         method: String(opt.method || "GET").toUpperCase(),
-        headers: opt.headers || { "User-Agent": UA },
+        headers: opt.headers || {
+          "User-Agent": UA,
+          Accept: "*/*",
+        },
       };
       if (opt.body != null) req.body = opt.body;
-      if (usePolicy) req.opts = { policy: usePolicy };
+      if (policy) req.opts = { policy: policy };
 
       $task.fetch(req).then(
         function (resp) {
-          const statusCode = Number(resp.statusCode);
+          const code = Number(resp.statusCode);
           if (
             !opt.allowError &&
-            (!isFinite(statusCode) || statusCode < 200 || statusCode >= 300)
+            (!isFinite(code) || code < 200 || code >= 400)
           ) {
-            reject(new Error("HTTP " + (statusCode || "?")));
-            return;
+            // 3xx 也当失败；允许 200-399 较宽松
+            if (!isFinite(code) || code < 200 || code >= 400) {
+              reject(new Error("HTTP " + (code || "?")));
+              return;
+            }
           }
           resolve({
-            statusCode: statusCode,
-            body: String(resp.body || ""),
-            headers: resp.headers || {},
+            statusCode: code,
+            body: String(resp.body == null ? "" : resp.body),
           });
         },
         function (reason) {
@@ -1126,11 +916,9 @@ function fetchRaw(url, options) {
   }
 
   if (mode === "node") {
-    if (POLICY) return once(POLICY);
-    return once(null);
+    return POLICY ? once(POLICY) : once(null);
   }
   if (mode === "direct") {
-    // 部分版本 policy:direct 异常，失败则无 policy 重试
     return once("direct").catch(function () {
       return once(null);
     });
@@ -1140,17 +928,10 @@ function fetchRaw(url, options) {
 
 // ── 工具 ─────────────────────────────────────────────────
 
-function safe(promise, fallback) {
-  return Promise.resolve(promise).catch(function (e) {
-    log("safe: " + err(e));
-    return fallback;
-  });
-}
-
 function withTimeout(promise, ms, fallback) {
   return new Promise(function (resolve) {
     let done = false;
-    const timer = setTimeout(function () {
+    const t = setTimeout(function () {
       if (!done) {
         done = true;
         resolve(fallback);
@@ -1160,14 +941,14 @@ function withTimeout(promise, ms, fallback) {
       function (v) {
         if (!done) {
           done = true;
-          clearTimeout(timer);
+          clearTimeout(t);
           resolve(v);
         }
       },
       function () {
         if (!done) {
           done = true;
-          clearTimeout(timer);
+          clearTimeout(t);
           resolve(fallback);
         }
       }
@@ -1176,8 +957,8 @@ function withTimeout(promise, ms, fallback) {
 }
 
 function sleep(ms) {
-  return new Promise(function (resolve) {
-    setTimeout(resolve, ms);
+  return new Promise(function (r) {
+    setTimeout(r, ms);
   });
 }
 
@@ -1189,22 +970,22 @@ function parseArgument(raw) {
       if (!pair) return;
       const i = pair.indexOf("=");
       if (i < 0) {
-        try {
-          out[decodeURIComponent(pair)] = "1";
-        } catch (e) {
-          out[pair] = "1";
-        }
+        out[safeDecode(pair)] = "1";
         return;
       }
-      let k = pair.slice(0, i).trim();
-      let v = pair.slice(i + 1).trim();
-      try {
-        k = decodeURIComponent(k);
-        v = decodeURIComponent(v);
-      } catch (e) {}
-      if (k) out[k] = v;
+      out[safeDecode(pair.slice(0, i).trim())] = safeDecode(
+        pair.slice(i + 1).trim()
+      );
     });
   return out;
+}
+
+function safeDecode(s) {
+  try {
+    return decodeURIComponent(s);
+  } catch (e) {
+    return s;
+  }
 }
 
 function isTruthy(value, defaultValue) {
@@ -1221,7 +1002,7 @@ function normalizeIP(value) {
   if (
     parts.length === 4 &&
     parts.every(function (p) {
-      return /^\d{1,3}$/.test(p) && Number(p) >= 0 && Number(p) <= 255;
+      return /^\d{1,3}$/.test(p) && +p >= 0 && +p <= 255;
     })
   ) {
     return text;
@@ -1231,32 +1012,24 @@ function normalizeIP(value) {
 
 function displayIP(ip) {
   if (!MASK_IP) return ip;
-  const parts = String(ip).split(".");
-  if (parts.length !== 4) return ip;
-  return parts[0] + "." + parts[1] + ".*.*";
+  const p = String(ip).split(".");
+  if (p.length !== 4) return ip;
+  return p[0] + "." + p[1] + ".*.*";
 }
 
-function numberOrNull(value) {
-  if (value == null || value === "") return null;
-  const n = Number(value);
+function numberOrNull(v) {
+  if (v == null || v === "") return null;
+  const n = Number(v);
   return isFinite(n) ? n : null;
-}
-
-function formatMs(ms) {
-  const n = Number(ms);
-  if (!isFinite(n) || n <= 0) return "0ms";
-  if (n >= 100) return Math.round(n) + "ms";
-  return n.toFixed(1) + "ms";
 }
 
 function isTaiwanRegion(code, country) {
   const c = String(code || "")
     .toUpperCase()
     .replace(/[^A-Z]/g, "");
-  const n = String(country || "");
   if (c === "TW" || c === "TWN") return true;
   return /taiwan|twn|台灣|台湾|臺湾|中华民国|中華民國|taipei|台北|臺北/i.test(
-    n
+    String(country || "")
   );
 }
 
@@ -1271,8 +1044,7 @@ function flagsEmoji(countryCode) {
       code.charCodeAt(0) + 0x1f1a5,
       code.charCodeAt(1) + 0x1f1a5
     );
-    if (emoji === "🇹🇼") return "🇨🇳";
-    return emoji;
+    return emoji === "🇹🇼" ? "🇨🇳" : emoji;
   } catch (e) {
     return "";
   }
@@ -1329,8 +1101,8 @@ function doneOK(title, subtitle, body, html, theme) {
     title: title || "节点 IP 质量检测",
     htmlMessage:
       html ||
-      '<div style="font-family:-apple-system;padding:12px">' +
-        escapeHtml(body || "完成") +
+      '<div style="font-family:-apple-system;padding:10px;white-space:pre-wrap">' +
+        escapeHtml(body || "") +
         "</div>",
   };
   if (theme && theme.sfSymbol) payload.icon = theme.sfSymbol;
@@ -1338,23 +1110,42 @@ function doneOK(title, subtitle, body, html, theme) {
   $done(payload);
 }
 
+function failSoft(message) {
+  // 超时软失败：若已有 lines 则带上
+  if (finished) return;
+  if (lines.length) {
+    lines.push("");
+    lines.push("⚠️ " + message);
+    doneOK(
+      "🌐 节点 IP 质量检测",
+      POLICY || "超时",
+      lines.join("\n"),
+      '<div style="font-family:-apple-system;padding:10px;white-space:pre-wrap">' +
+        escapeHtml(lines.join("\n")) +
+        "</div>",
+      { sfSymbol: "clock.badge.exclamationmark", color: "#FF9F0A" }
+    );
+    return;
+  }
+  fail(message);
+}
+
 function fail(message) {
   if (finished) return;
   finished = true;
-  const title = "⚠️ 节点 IP 质量检测";
   const msg = String(message || "未知错误");
   try {
-    $notify(title, "失败", msg);
+    $notify("⚠️ 节点 IP 质量检测", "失败", msg);
   } catch (e) {}
   $done({
-    title: title,
+    title: "⚠️ 节点 IP 质量检测",
     htmlMessage:
       '<div style="font-family:-apple-system;text-align:center;padding:12px">' +
-      '<div style="font-size:32px">⚠️</div>' +
-      '<div style="margin-top:10px;font-size:15px;font-weight:600;color:#FF453A;line-height:1.4">' +
+      '<div style="font-size:30px">⚠️</div>' +
+      '<div style="margin-top:10px;font-size:15px;font-weight:600;color:#FF453A">' +
       escapeHtml(msg) +
       "</div>" +
-      '<div style="margin-top:12px;font-size:12px;color:#8e8e93;line-height:1.4">可尝试：长按节点运行 · 开启 Tunnel · argument=block=0</div>' +
+      '<div style="margin-top:10px;font-size:12px;color:#8e8e93;line-height:1.45">请确认：长按节点 · Tunnel 已开 · 脚本为 qx4.2<br/>配置勿写 block=1 除非必要</div>' +
       "</div>",
     icon: "exclamationmark.triangle.fill",
     "icon-color": "#FF453A",
