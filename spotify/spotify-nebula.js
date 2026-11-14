@@ -17,47 +17,37 @@ const expire = (() => {
 
 // 类型: b = bool, i = int64, s = string
 const OVERRIDES = {
+    // 账号类型 / UI
     'type': ['s', 'premium'],
     'catalogue': ['s', 'premium'],
     'name': ['s', 'Spotify Premium'],
-    'player-license': ['s', 'premium'],
-    'financial-product': ['s', 'pr:premium,tc:0'],
-    'product-expiry': ['s', expire],
-    'subscription-enddate': ['s', expire],
-    'streaming': ['b', true],
-    'streaming-rules': ['s', ''],
+    // 去广告
     'ads': ['b', false],
+    // 功能解锁
     'on-demand': ['b', true],
-    'high-bitrate': ['b', true],
-    'libspotify': ['b', true],
-    'offline': ['b', true],
-    'mobile': ['b', true],
     'unrestricted': ['b', true],
-    'audio-quality': ['s', '1'],
     'shuffle': ['b', false],
     'pick-and-shuffle': ['b', false],
     'smart-shuffle': ['s', 'AVAILABLE'],
     'shuffle-algorithm': ['s', 'RANDOM'],
-    'is-euterpe': ['b', true],
-    'is-thalia': ['b', true],
-    'is-pigeon': ['b', true],
-    'has-audiobooks-subscription': ['b', true],
-    'can_use_superbird': ['b', true],
-    'jam-social-session': ['s', 'EXPANDED'],
-    'social-session': ['b', true],
-    'social-session-free-tier': ['b', false],
-    'offline-backup': ['s', 'UNRESTRICTED'],
-    'lyrics-offline': ['b', true],
     'mixing-tools': ['s', 'EDIT'],
     'your-library-tags': ['b', true],
-    'loudness-levels': ['s', '1:-5.0,0.0,3.0:-2.0'],
-    'payments-initial-campaign': ['s', 'prepaid'],
+    // 社交 / 会话
+    'social-session': ['b', true],
+    'social-session-free-tier': ['b', false],
+    'jam-social-session': ['s', 'EXPANDED'],
+    // 订阅信息（客户端用来判断"会员还有效"）
+    'financial-product': ['s', 'pr:premium,tc:0'],
     'payments-locked-state': ['b', false],
+    'product-expiry': ['s', expire],
+    'subscription-enddate': ['s', expire],
+    // UI 清理
     'nft-disabled': ['s', '1'],
-    'audiobook-onboarding-completed': ['b', true],
-    'com.spotify.madprops.use.ucs.product.state': ['b', true],
-    'com.spotify.madprops.delivered.by.ucs': ['b', true],
 };
+
+// 注意：player-license / high-bitrate / audio-quality / is-pigeon / loudness-levels
+// 一律不要动。改了它们客户端会去请求 320k / 无损档文件，服务端按真实订阅回 403，
+// 播放器拿不到 key 就跳下一首（实测，2026-11-14）。音质就停在免费档。
 
 /* ---------------- 工具 ---------------- */
 function utf8enc(str) {
