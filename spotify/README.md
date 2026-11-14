@@ -14,6 +14,16 @@ https://raw.githubusercontent.com/dhicoc/qx-ipquality/master/spotify/spotify.con
 仓库内另有 `spotify-local.conf`，用本地脚本（放 QX 的 Scripts 目录）而不是远程拉取，
 适合 raw.githubusercontent.com 直连不通的情况。
 
+## 版本对照
+
+| Spotify 版本 | 用哪个配置 | 状态 |
+|---|---|---|
+| **8.9.60**（旧版） | `spotify-8x.conf` | 走旧的 customize 接口，app2smile 原脚本可用 |
+| 9.2.0+ | `spotify.conf` | 走 nebula 接口，本仓库自研脚本 |
+
+两套**不要同时启用**。8.x 用老模块时，务必把 9.x 的 `spotify.conf` 停用，
+尤其别让 `spotify-ads.js` 跑起来——8.x 的广告链路和 9.x 不一样，清 pod 可能导致跳歌。
+
 ## 结论（为什么会失效）
 
 Spotify 9.x 把「账号产品状态」的接口整个换了：
