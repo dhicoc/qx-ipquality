@@ -1,5 +1,19 @@
 # Spotify iOS 9.2.x 解锁 Premium · Quantumult X
 
+## 一键导入
+
+重写模块地址（Quantumult X → 重写 → 引用 → 添加）：
+
+```
+https://raw.githubusercontent.com/dhicoc/qx-ipquality/master/spotify/spotify.conf
+```
+
+导入后确认 MitM 主机名含 `spclient.wg.spotify.com`、`*spclient.spotify.com`，证书已信任，
+然后从后台彻底杀掉 Spotify 再打开。
+
+仓库内另有 `spotify-local.conf`，用本地脚本（放 QX 的 Scripts 目录）而不是远程拉取，
+适合 raw.githubusercontent.com 直连不通的情况。
+
 ## 结论（为什么会失效）
 
 Spotify 9.x 把「账号产品状态」的接口整个换了：
