@@ -25,6 +25,8 @@ const OVERRIDES = {
     'ads': ['b', false],
     // 功能解锁
     'on-demand': ['b', true],
+    // 免费档的 "只能随机播放" 规则，必须清空，否则点播会被判定非法直接跳歌
+    'streaming-rules': ['s', ''],
     'unrestricted': ['b', true],
     'shuffle': ['b', false],
     'pick-and-shuffle': ['b', false],
