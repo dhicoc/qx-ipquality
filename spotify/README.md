@@ -74,6 +74,28 @@ map entry: `field 1 = key(string)`, `field 2 = Attribute`。
 
 另外 nebula 属性里 `ads=false` 也会让客户端不再主动请求广告，两层叠加。
 
+## 音质
+
+抓包证据：免费账号播放时 stream reporting 里是 `Vorbis 96 kbps`（`best matching bitrate`），96k 是免费档上限。
+
+档位枚举：`DEFAULT / NORMAL / HIGH / VERY_HIGH(320k) / HIFI(无损) / HIFI_24`。
+
+两道门：
+
+| 门 | 来源 | 处理 |
+|---|---|---|
+| 产品状态 | nebula 的 `high-bitrate`、`player-license`、`is-pigeon` | 主脚本已设为 premium / true |
+| 设备能力 | `device-capabilities` 的 `license`、`audio_quality`、`supports_hifi.user_eligible` | `spotify-capabilities.js`（第 4 条） |
+
+设备能力补丁会把 `license`/`effective_license` 改成 `premium`、当前档位设 `VERY_HIGH`、
+`supports_hifi.user_eligible` 设 `true`（无损选项才会出现）。
+
+无损能不能真播取决于服务端是否给 HIFI 的 key，能选 ≠ 能播，播不了会自动回落到 320k；
+320k 都播不了就把第 4 条注释掉，只留 nebula 补丁。
+
+验证：抓 `POST /gabo-receiver-service/v3/events`，解出来的明文里有
+`Vorbis 96 kbps` / `Vorbis 320 kbps` / `AAC ...`，改成 320 就是成了。
+
 ## 安装
 
 1. 三个 `.js` 存到 **我的 iPhone → Quantumult X → Scripts**
