@@ -190,6 +190,11 @@ function patchProto(bytes) {
         for (let j = 0; j < e.length; j++) out.push(e[j]);
     }
     log(`entries=${seen} replaced=${patched} kept=${kept} added=${Object.keys(OVERRIDES).length}`);
+    try {
+        $notification.post('Spotify 补丁',
+            'nebula 已改写',
+            `replaced=${patched} kept=${kept} added=${Object.keys(OVERRIDES).length}`);
+    } catch (e) {}
     return out;
 }
 
