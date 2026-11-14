@@ -74,20 +74,30 @@ map entry: `field 1 = key(string)`, `field 2 = Attribute`。
 
 另外 nebula 属性里 `ads=false` 也会让客户端不再主动请求广告，两层叠加。
 
-## 音质（实测定论：别碰）
+## 音质：别碰，会直接把播放搞坏
 
-免费账号播放时 stream reporting 里是 `Vorbis 96 kbps`，96k 是免费档上限。
+实测证据（2026-11-14 抓包）：客户端按 320k/无损档去要文件时，
 
-档位枚举：`DEFAULT / NORMAL / HIGH / VERY_HIGH(320k) / HIFI(无损) / HIFI_24`。
+```
+GET  /storage-resolve/v2/files/audio/interactive/2/<file_id>   → 200（文件能下）
+POST /playplay/v1/key/<file_id>                                → 403（密钥被拒）
+```
 
-两道门：产品状态（nebula 的 `high-bitrate`、`player-license`，主脚本处理）+
-设备能力（`device-capabilities` 的 `license`、`audio_quality`、`supports_hifi.user_eligible`）。
+拿不到密钥 → 播放器播几秒或直接跳到下一首 → 循环。
 
-**实测：把 device-capabilities 改成 premium/VERY_HIGH 后客户端会去请求 320k 的文件和 key，
-服务端按真实订阅拒发，结果无法播放。** 所以 `spotify-capabilities.js` 保留在仓库里但规则默认注释，
-想研究可以自己开，日常别开。
+所以 `player-license`、`high-bitrate`、`audio-quality`、`is-pigeon`、`loudness-levels`
+**一个都不要改**，保持服务端下发的免费档值。改了会让客户端误判自己有权播高码率。
 
-只靠 nebula 那一层时，档位能到「高」，`极高` 仍受服务端限制。
+真正会导致跳歌的判定链：
+
+| 属性 | 免费值 | 改成 premium 后 |
+|---|---|---|
+| `player-license` | `mft` | 客户端去要 320k 文件 → key 403 |
+| `high-bitrate` | `false` | 同上 |
+| `audio-quality` | 缺省 | 同上 |
+| `is-pigeon` | 缺省 | 会去试无损档 → 更容易 403 |
+
+音质就停在免费档（96 kbps）。要真 320k 只能靠真实订阅。
 
 ## 安装
 
