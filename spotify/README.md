@@ -58,7 +58,21 @@ map entry: `field 1 = key(string)`, `field 2 = Attribute`。
 - `spotify.conf` —— QX 重写模块（规则）
 - `spotify-nebula.js` —— 响应体改写：free → premium（protobuf + JSON 双支持）
 - `spotify-nebula-header.js` —— 删 `If-None-Match`，强制 200（关键，不然一直 304）
+- `spotify-ads.js` —— 去广告：`/ads/v3/ads` 回空 pod，`/ad-logic/prefetch` 回无广告决策
 - `spotify-capabilities.js` —— 可选：device-capabilities 伪装 premium/高音质，默认关闭
+
+## 去广告原理
+
+9.2.0 的广告只有两个入口：
+
+| 接口 | 作用 | 处理 |
+|---|---|---|
+| `POST /ads/v3/ads?slots=...` | 拉取 marquee/embedded 等展示类广告 | 按请求的 slot 回空数组 `{"pod":{"slot":[]}}` |
+| `POST /ad-logic/prefetch` | 音频流广告（preroll/midroll）预取，返回 pod 里真实广告 | 回服务端"无广告"时的标准结构，`pod:{}`、`max_ads:0` |
+
+`/ad-logic/v3/config`、`/ad-logic/state/config` 是广告配置，不动。
+
+另外 nebula 属性里 `ads=false` 也会让客户端不再主动请求广告，两层叠加。
 
 ## 安装
 
