@@ -70,9 +70,9 @@ haijiao/qx/
 
 安装三步：
 
-**1. 换域名**
+**1. 域名**
 
-把 `haijiao-qx.conf` 里的 `hj.example.com` 全换成实际域名（5 处：4 条 rewrite + hostname）。
+配置已按 `haijiao.com` 填好，直接粘。如果你的站是 `www.haijiao.com` / `m.haijiao.com`，给 4 条 rewrite 各复制一份换掉域名，`hostname` 写 `*.haijiao.com`。
 
 **2. 放脚本**
 
