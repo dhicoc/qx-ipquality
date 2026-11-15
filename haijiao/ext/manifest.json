@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "海角解锁补丁",
+  "version": "3.0.0",
+  "description": "MAIN world 补丁：通行证取址改写 + 广告拦截 + 30 秒试看门禁摘除",
+  "minimum_chrome_version": "111",
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["patch.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    }
+  ]
+}
