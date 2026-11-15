@@ -110,6 +110,24 @@ QX 生成证书 → 安装 → **系统设置 → 通用 → 关于本机 → �
 
 ---
 
+## 实测记录（2026-11-15，haijiao.com）
+
+| 验证项 | 结果 |
+|---|---|
+| `GET /api/topic/node/topics?node_id=888&page=1&limit=3` | `200`，无需登录，`total=10016` |
+| 响应结构 | `{isEncrypted:true}` + **三层** base64，剥开是 `{page:{...},results:[...]}` |
+| `results[].money_type` | 存在；`money_type=0` 的有 `24710`（管理员公告）、`1839442`（认证须知） |
+| `POST /api/attachment` | 端点存在，空参数返回 `{"isEncrypted":false,"message":"请求错误"}` |
+| 首页 `/` | 先返回 `welcome` JS 挑战页（混淆脚本），过挑战后才出真正的 SPA |
+| 根路径 HEAD | `404` + 挑战页（用 GET 才正常） |
+
+两点据此改过的逻辑：
+
+- **探测不再要求登录**：`/api/topic/node/topics` 公开可读，没 `token`/`uid` 也照探（有就带上）。扩展版和 QX 版都改了。
+- **注入加了应用页判断**：只有 HTML 里出现 `id="app"` / `__vue__` / `dplayer` / `video-div` 才注入，避开 `welcome` 挑战页，免得干扰它的 JS。
+
+还剩一处没法离线验证：`POST /api/attachment` 的**真实请求体字段**（无参时报「请求错误」）。`resource_id` / `resource_type` 是照原脚本写的，第一次跑的时候看扩展角标的 `__hjMainPatchState.seen`，或 QX 日志，能直接看到原始 body。
+
 ## 失效点（站点一改版就断的地方）
 
 1. `NODES = ['888','900','972','300']` —— 免费帖来源，站点没这些 node 或没免费帖就探不到
