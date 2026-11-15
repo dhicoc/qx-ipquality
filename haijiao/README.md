@@ -59,11 +59,14 @@ haijiao/
 
 ```
 haijiao/qx/
-├── haijiao-qx.conf   # [rewrite_local] + [mitm]
-├── hj-pass.js        # script-request-body  取址改写（核心）
-├── hj-banner.js      # script-response-body 广告接口置空
-└── hj-html.js        # script-response-body HTML 注入（门禁摘除）
+├── haijiao-qx.conf         # 本地脚本版：[rewrite_local] + [mitm]
+├── haijiao-qx-remote.conf  # 远程脚本版：已填好本仓库 raw 地址，只改域名就能用
+├── hj-pass.js              # script-request-body  取址改写（核心）
+├── hj-banner.js            # script-response-body 广告接口置空
+└── hj-html.js              # script-response-body HTML 注入（门禁摘除）
 ```
+
+省事的话直接用 `haijiao-qx-remote.conf`，四个脚本都指向本仓库，你只需要把域名换掉。
 
 安装三步：
 
