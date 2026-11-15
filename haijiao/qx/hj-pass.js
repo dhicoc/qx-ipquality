@@ -96,7 +96,8 @@ function run(o) {
     var cached = getCache();
     if (cached > 0) { fin(rewrite(o, cached)); return; }
     var tk = pickToken();
-    if (!tk.token || !tk.uid) { console.log('hj: 请求里没 token/uid —— 先登录站点'); fin(); return; }
+    // /api/topic/node/topics 是公开接口，没登录也能探（实测 200）
+    if (!tk.token || !tk.uid) console.log('hj: 无 token/uid，按公开接口探');
     probe(o, tk, 0);
 }
 
@@ -132,14 +133,12 @@ function probe(o, tk, i) {
     var origin = m ? m[1] : '';
     if (!origin) { fin(); return; }
     var u = origin + '/api/topic/node/topics?node_id=' + NODES[i] + '&page=1&limit=20';
+    var hd = { 'pcVer': '2', 'Accept': 'application/json' };
+    if (tk.token) hd['X-User-Token'] = tk.token;
+    if (tk.uid) hd['X-User-Id'] = tk.uid;
     $task.fetch({
         url: u,
-        headers: {
-            'X-User-Token': tk.token,
-            'X-User-Id': tk.uid,
-            'pcVer': '2',
-            'Accept': 'application/json'
-        }
+        headers: hd
     }).then(function (r) {
         var j = null;
         try { j = decodeBody(r.body || ''); } catch (e) { }
