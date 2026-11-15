@@ -215,7 +215,8 @@
     function pickPassTopic() {
         var token = ck('token');
         var uid = ck('uid');
-        if (!token || !uid) { st.err.push('no-auth'); badge(); return; }
+        // 未登录也照探：/api/topic/node/topics 是公开接口（实测 200，无需 token）
+        if (!token || !uid) st.err.push('no-auth');
         st.token = true;
         if (st.passTopic > 0) { badge(); return; }
         var nodes = ['888', '900', '972', '300'];
@@ -226,12 +227,11 @@
                 return;
             }
             var n = nodes[idx];
+            var hdr = { 'pcVer': '2' };
+            if (token) hdr['X-User-Token'] = token;
+            if (uid) hdr['X-User-Id'] = String(uid);
             fetch('/api/topic/node/topics?node_id=' + n + '&page=1&limit=20', {
-                headers: {
-                    'X-User-Token': token,
-                    'X-User-Id': String(uid),
-                    'pcVer': '2'
-                }
+                headers: hdr
             }).then(function (r) { return r.text(); }).then(function (txt) {
                 var j = decodeBody(txt);
                 var list = (j && j.results) || [];
